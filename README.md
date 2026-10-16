@@ -1,5 +1,7 @@
 # tg-topics — Claude Code в Telegram, отдельная сессия на каждую тему
 
+https://github.com/Daniel829363/tg-topics-for-claude
+
 Надстройка над официальным Telegram-плагином Claude Code (`telegram@claude-plugins-official`).
 
 - **Каждая тема супергруппы — своя сессия Claude Code.** У сессии своя папка, свои правила (`INSTRUCTIONS.md`), своя сжатая память (`MEMORY.md`) и история (`history.jsonl`). Личка с ботом — основная сессия. Сессии работают параллельно и открываются сами на первое сообщение (вкладки Windows Terminal).
@@ -33,7 +35,7 @@ Claude Code пускает без вопросов только каналы и�
 
 ```
 /plugin install telegram@claude-plugins-official
-/plugin marketplace add <github-user>/tg-topics
+/plugin marketplace add Daniel829363/tg-topics-for-claude
 /plugin install tg-topics@tg-topics
 /reload-plugins
 /telegram:configure 123456789:AAH...
@@ -138,7 +140,7 @@ Claude Code пускает без вопросов только каналы и�
 
 ## Как передать другим
 
-- **GitHub.** Залей эту папку в публичный репозиторий. Другие ставят по шагам из раздела «Установка» с `/plugin marketplace add <твой-github>/tg-topics`. Обновления получают через `/plugin marketplace update tg-topics`.
+- **GitHub.** Репозиторий: https://github.com/Daniel829363/tg-topics-for-claude. Другие ставят по шагам из раздела «Установка». Обновления получают через `/plugin marketplace update tg-topics`.
 - **Архивом.** Отправь zip этой папки. Человек распаковывает и выполняет `/plugin marketplace add C:\путь\к\tg-topics`, дальше те же шаги.
 
 У каждого свой бот, токен и доступ. В репозитории нет ничего личного: токен и `access.json` хранятся в `~/.claude/channels/telegram/`, а не в плагине.

@@ -3,7 +3,8 @@
   "name": "tg-topics",
   "description": "Telegram ↔ Claude Code: a separate Claude session for every forum topic, bot command menu, /help and setup guide.",
   "owner": {
-    "name": "aidoolot"
+    "name": "Daniel829363",
+    "url": "https://github.com/Daniel829363"
   },
   "plugins": [
     {
@@ -11,7 +12,8 @@
       "description": "Add-on for the official Telegram channel: every forum topic gets its own Claude Code session with its own instructions and memory; bot menu, /help, /setup and /id commands; one-command setup.",
       "version": "1.0.0",
       "category": "productivity",
-      "source": "./plugins/tg-topics"
+      "source": "./plugins/tg-topics",
+      "homepage": "https://github.com/Daniel829363/tg-topics-for-claude"
     }
   ]
 }
