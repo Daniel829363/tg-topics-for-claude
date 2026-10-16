@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "tg-topics",
+  "description": "Telegram ↔ Claude Code: a separate Claude session for every forum topic, bot command menu, /help and setup guide.",
+  "owner": {
+    "name": "aidoolot"
+  },
+  "plugins": [
+    {
+      "name": "tg-topics",
+      "description": "Add-on for the official Telegram channel: every forum topic gets its own Claude Code session with its own instructions and memory; bot menu, /help, /setup and /id commands; one-command setup.",
+      "version": "1.0.0",
+      "category": "productivity",
+      "source": "./plugins/tg-topics"
+    }
+  ]
+}

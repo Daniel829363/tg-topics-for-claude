@@ -1,0 +1,9 @@
+tg-topics
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+plugins/tg-topics/overlay/server.ts is a modified version of server.ts from
+the Telegram plugin in anthropics/claude-plugins-official
+(https://github.com/anthropics/claude-plugins-official), licensed under the
+Apache License, Version 2.0. Modifications: forum-topic support, router mode
+(tg-router), per-topic history, shared bot commands and command menu
+(bot-ui.ts). See the header comment in the file.

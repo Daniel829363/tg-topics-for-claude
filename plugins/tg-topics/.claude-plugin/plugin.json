@@ -1,0 +1,10 @@
+{
+  "name": "tg-topics",
+  "version": "1.0.0",
+  "description": "Add-on for the official Telegram channel (telegram@claude-plugins-official): routes every forum topic to its own Claude Code session with its own instructions and memory, keeps the bot command menu in sync, adds /help, /setup, /id and /sessions to the bot.",
+  "author": {
+    "name": "aidoolot"
+  },
+  "license": "Apache-2.0",
+  "keywords": ["telegram", "channel", "topics", "router", "sessions"]
+}

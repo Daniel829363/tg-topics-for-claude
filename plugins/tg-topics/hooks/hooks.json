@@ -1,0 +1,28 @@
+{
+  "description": "tg-topics: keeps the Telegram overlay and tg-router running; reminds topic sessions to update MEMORY.md",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun \"${CLAUDE_PLUGIN_ROOT}/scripts/tgt.ts\" hook-start",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun \"${CLAUDE_PLUGIN_ROOT}/hooks/memory-reminder.ts\"",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}
