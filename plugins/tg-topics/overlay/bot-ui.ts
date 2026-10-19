@@ -1,6 +1,6 @@
 /**
  * tg-topics — the bot's command menu and the texts behind /start, /help,
- * /setup, /id, /status and /sessions.
+ * /setup, /id, /status, /sessions and /limits.
  *
  * Shared by tg-router (which answers commands itself while it runs) and the
  * overlaid telegram channel server (which answers them when no router is
@@ -11,6 +11,7 @@
 import { readFileSync, writeFileSync, mkdirSync } from 'fs'
 import { createHash } from 'crypto'
 import { join } from 'path'
+import { homedir } from 'os'
 
 export type Lang = 'ru' | 'en'
 
@@ -33,6 +34,7 @@ const PRIVATE_MENU: MenuItem[] = [
   { command: 'id', ru: 'Мой Telegram ID', en: 'My Telegram ID' },
   { command: 'status', ru: 'Есть ли у меня доступ', en: 'My access status' },
   { command: 'sessions', ru: 'Запущенные сессии Claude', en: 'Running Claude sessions' },
+  { command: 'limits', ru: 'Лимиты Claude: сессия и неделя', en: 'Claude usage limits: session and week' },
 ]
 
 const GROUP_MENU: MenuItem[] = [
@@ -40,9 +42,10 @@ const GROUP_MENU: MenuItem[] = [
   { command: 'id', ru: 'ID группы и темы + команда подключения', en: 'Group and topic ID + connect command' },
   { command: 'setup', ru: 'Команды для терминала', en: 'Terminal commands' },
   { command: 'sessions', ru: 'Запущенные сессии Claude', en: 'Running Claude sessions' },
+  { command: 'limits', ru: 'Лимиты Claude', en: 'Claude usage limits' },
 ]
 
-export const KNOWN_COMMANDS = new Set(['start', 'help', 'setup', 'id', 'status', 'sessions'])
+export const KNOWN_COMMANDS = new Set(['start', 'help', 'setup', 'id', 'status', 'sessions', 'limits'])
 
 function menu(items: MenuItem[], lang: Lang): { command: string; description: string }[] {
   return items.map(i => ({ command: i.command, description: i[lang] }))
@@ -148,15 +151,17 @@ export type CommandEnv = {
  * HTML reply for a known command, or null to stay silent. Same rules as the
  * channel's gate: strangers get nothing in allowlist mode and in groups that
  * weren't added; in pairing mode they only learn how to ask for access.
+ * Async because /limits asks Anthropic for the numbers.
  */
-export function handleCommand(cmd: string, msg: any, env: CommandEnv): string | null {
+export async function handleCommand(cmd: string, msg: any, env: CommandEnv): Promise<string | null> {
   const from = msg?.from
   if (!from || !msg.chat) return null
   const a = env.access
   if (a.dmPolicy === 'disabled') return null
   const sender = String(from.id)
   const owner = a.allowFrom.includes(sender)
-  const t = TEXTS[langOf(from.language_code)]
+  const lang = langOf(from.language_code)
+  const t = TEXTS[lang]
 
   if (msg.chat.type === 'private') {
     if (!owner && a.dmPolicy !== 'pairing') return null
@@ -168,6 +173,7 @@ export function handleCommand(cmd: string, msg: any, env: CommandEnv): string | 
       case 'id': return t.idPrivate(sender, from.username, owner ? 'yes' : pending ? 'pending' : 'no')
       case 'status': return owner ? t.statusOwner(from.username ?? sender, a) : t.statusGuest(pending?.[0])
       case 'sessions': return owner ? t.sessions(env.sessions) : null
+      case 'limits': return owner ? limitsText(lang) : null
     }
     return null
   }
@@ -198,9 +204,74 @@ export function handleCommand(cmd: string, msg: any, env: CommandEnv): string | 
         return owner ? t.setup(a) : t.help(env.sessions !== undefined)
       case 'sessions':
         return owner ? t.sessions(env.sessions) : null
+      case 'limits':
+        return owner ? limitsText(lang) : null
     }
   }
   return null
+}
+
+// ---- Claude usage limits ------------------------------------------------------------
+
+// The endpoint behind Claude Code's /usage screen. It isn't a documented API,
+// so an answer without the expected fields is reported, not guessed at.
+// The token only ever goes to this URL and is never logged (tests point
+// TG_TOPICS_USAGE_URL at their mock).
+const USAGE_URL = process.env.TG_TOPICS_USAGE_URL ?? 'https://api.anthropic.com/api/oauth/usage'
+
+type Creds = { accessToken?: string; expiresAt?: number; subscriptionType?: string; rateLimitTier?: string }
+type LimitRow = { kind: string; percent: number; resets_at?: string; model?: string }
+
+/** Claude Code's own login (Windows/Linux keep it in a file; macOS uses the Keychain). */
+function readCreds(): Creds | null {
+  const dir = process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude')
+  try { return JSON.parse(readFileSync(join(dir, '.credentials.json'), 'utf8')).claudeAiOauth ?? null } catch { return null }
+}
+
+function planName(c: Creds): string {
+  const tier = c.rateLimitTier?.match(/max_(\d+x)/)
+  if (tier) return `Max ${tier[1]}`
+  const s = c.subscriptionType ?? ''
+  return s.charAt(0).toUpperCase() + s.slice(1)
+}
+
+/** The rows of the usage answer: the `limits` list, or the older five_hour / seven_day fields. */
+function limitRows(u: any): LimitRow[] {
+  if (Array.isArray(u?.limits)) {
+    return u.limits
+      .filter((l: any) => typeof l?.percent === 'number')
+      .map((l: any) => ({ kind: String(l.kind), percent: l.percent, resets_at: l.resets_at ?? undefined, model: l.scope?.model?.display_name ?? undefined }))
+  }
+  const rows: LimitRow[] = []
+  const add = (kind: string, w: any, model?: string) => {
+    if (typeof w?.utilization === 'number') rows.push({ kind, percent: w.utilization, resets_at: w.resets_at ?? undefined, model })
+  }
+  add('session', u?.five_hour)
+  add('weekly_all', u?.seven_day)
+  add('weekly_scoped', u?.seven_day_opus, 'Opus')
+  add('weekly_scoped', u?.seven_day_sonnet, 'Sonnet')
+  return rows
+}
+
+/** The /limits reply. Never throws: problems come back as a readable message. */
+export async function limitsText(lang: Lang): Promise<string> {
+  const t = TEXTS[lang]
+  const creds = readCreds()
+  if (!creds?.accessToken) return t.limitsError('login')
+  if (creds.expiresAt && creds.expiresAt < Date.now()) return t.limitsError('expired')
+  try {
+    const res = await fetch(USAGE_URL, {
+      headers: { authorization: `Bearer ${creds.accessToken}`, 'anthropic-beta': 'oauth-2025-04-20' },
+      signal: AbortSignal.timeout(15000),
+    })
+    if (res.status === 401) return t.limitsError('expired')
+    if (!res.ok) return t.limitsError('failed', `HTTP ${res.status}`)
+    const rows = limitRows(await res.json())
+    if (!rows.length) return t.limitsError('failed', lang === 'ru' ? 'в ответе нет лимитов' : 'no limits in the answer')
+    return t.limits(planName(creds), rows)
+  } catch (err) {
+    return t.limitsError('failed', String(err))
+  }
 }
 
 /** The /setup guide as plain text — for the terminal (tgt guide). */
@@ -245,6 +316,8 @@ type Texts = {
   statusOwner(name: string, a: AccessLike): string
   statusGuest(code?: string): string
   sessions(list?: SessionItem[]): string
+  limits(plan: string, rows: LimitRow[]): string
+  limitsError(kind: 'login' | 'expired' | 'failed', detail?: string): string
 }
 
 function sessionName(s: SessionItem, lang: Lang): string {
@@ -257,6 +330,30 @@ function time(ms: number | undefined, lang: Lang): string {
   return new Date(ms).toLocaleTimeString(lang === 'ru' ? 'ru-RU' : 'en-GB', { hour: '2-digit', minute: '2-digit' })
 }
 
+const bar = (p: number) => '▰'.repeat(Math.min(10, Math.round(p / 10))) + '▱'.repeat(10 - Math.min(10, Math.round(p / 10)))
+const dot = (p: number) => (p >= 90 ? '🔴' : p >= 70 ? '🟡' : '🟢')
+
+/** "at 11:40 (in 1 h 54 min)" or "Oct 23, 09:00 (in 4 d 4 h)", in the computer's time zone. */
+function resetAt(iso: string, lang: Lang): string {
+  const at = new Date(Math.round(Date.parse(iso) / 60000) * 60000) // the API sometimes says 09:59:59.9 for 10:00
+  const min = Math.max(0, Math.round((at.getTime() - Date.now()) / 60000))
+  const d = Math.floor(min / 1440), h = Math.floor((min % 1440) / 60), m = min % 60
+  const [D, H, M] = lang === 'ru' ? ['дн', 'ч', 'мин'] : ['d', 'h', 'min']
+  const left = d ? `${d} ${D} ${h} ${H}` : h ? `${h} ${H} ${m} ${M}` : `${m} ${M}`
+  const clock = time(at.getTime(), lang)
+  if (at.toDateString() === new Date().toDateString()) return lang === 'ru' ? `в ${clock} (через ${left})` : `at ${clock} (in ${left})`
+  const day = at.toLocaleDateString(lang === 'ru' ? 'ru-RU' : 'en-GB', lang === 'ru' ? { day: '2-digit', month: '2-digit' } : { day: 'numeric', month: 'short' })
+  return lang === 'ru' ? `${day} в ${clock} (через ${left})` : `${day}, ${clock} (in ${left})`
+}
+
+function limitLines(rows: LimitRow[], lang: Lang, name: (r: LimitRow) => string): string[] {
+  return rows.flatMap(r => [
+    '',
+    `${dot(r.percent)} ${esc(name(r))}: <b>${Math.round(r.percent)}%</b>`,
+    bar(r.percent) + (r.resets_at ? `  ${lang === 'ru' ? 'сброс' : 'resets'} ${resetAt(r.resets_at, lang)}` : ''),
+  ])
+}
+
 const RU: Texts = {
   startOwner: () => [
     '👋 <b>Claude Code в Telegram</b>',
@@ -266,6 +363,7 @@ const RU: Texts = {
     '/setup — что вводить в терминал: группы, люди, токен',
     '/id — твой ID',
     '/sessions — запущенные сессии',
+    '/limits — лимиты Claude',
   ].join('\n'),
 
   startGuest: () => [
@@ -300,6 +398,7 @@ const RU: Texts = {
     '/id — ID твой, группы и темы',
     '/status — есть ли у тебя доступ',
     '/sessions — запущенные сессии Claude',
+    '/limits — сколько лимита Claude израсходовано и когда сброс',
     '',
     'Текст в рамке копируется нажатием.',
   ].join('\n'),
@@ -380,6 +479,19 @@ const RU: Texts = {
     if (!list.length) return 'Нет запущенных сессий. Сессия запустится сама на первое сообщение.'
     return ['🖥 <b>Сессии Claude</b>', ...list.map(s => s.starting ? `⏳ ${sessionName(s, 'ru')} — запускается` : `🟢 ${sessionName(s, 'ru')} — с ${time(s.since, 'ru')}`)].join('\n')
   },
+
+  limits: (plan, rows) => [
+    `📊 <b>Лимиты Claude</b>${plan ? ` · ${esc(plan)}` : ''}`,
+    ...limitLines(rows, 'ru', r =>
+      r.kind === 'session' ? 'Сессия (5 ч)' : r.kind === 'weekly_all' ? 'Неделя, все модели' : r.kind === 'weekly_scoped' ? `Неделя, ${r.model ?? 'модель'}` : r.kind),
+  ].join('\n'),
+
+  limitsError: (kind, detail) =>
+    kind === 'login'
+      ? 'Не нашёл вход в Claude Code на этом компьютере (.credentials.json в папке .claude). Войди в Claude Code командой /login. На macOS вход хранится в связке ключей — там /limits пока не работает.'
+      : kind === 'expired'
+        ? 'Токен входа Claude Code устарел. Он обновится, когда любая сессия Claude Code сделает запрос: дай ей задачу и повтори /limits.'
+        : `Не удалось получить лимиты: ${esc(detail)}`,
 }
 
 function policyRu(p: AccessLike['dmPolicy']): string {
@@ -399,6 +511,7 @@ const EN: Texts = {
     '/setup — terminal commands: groups, people, token',
     '/id — your ID',
     '/sessions — running sessions',
+    '/limits — Claude usage limits',
   ].join('\n'),
 
   startGuest: () => [
@@ -433,6 +546,7 @@ const EN: Texts = {
     '/id — your, group and topic IDs',
     '/status — your access status',
     '/sessions — running Claude sessions',
+    '/limits — how much of the Claude usage limits is used and when they reset',
     '',
     'Tap any boxed text to copy it.',
   ].join('\n'),
@@ -513,6 +627,19 @@ const EN: Texts = {
     if (!list.length) return 'No running sessions. One starts on the first message.'
     return ['🖥 <b>Claude sessions</b>', ...list.map(s => s.starting ? `⏳ ${sessionName(s, 'en')} — starting` : `🟢 ${sessionName(s, 'en')} — since ${time(s.since, 'en')}`)].join('\n')
   },
+
+  limits: (plan, rows) => [
+    `📊 <b>Claude usage limits</b>${plan ? ` · ${esc(plan)}` : ''}`,
+    ...limitLines(rows, 'en', r =>
+      r.kind === 'session' ? 'Session (5 h)' : r.kind === 'weekly_all' ? 'Week, all models' : r.kind === 'weekly_scoped' ? `Week, ${r.model ?? 'one model'}` : r.kind),
+  ].join('\n'),
+
+  limitsError: (kind, detail) =>
+    kind === 'login'
+      ? 'No Claude Code login found on this computer (.credentials.json in the .claude folder). Log in to Claude Code with /login. On macOS the login lives in the Keychain, where /limits does not work yet.'
+      : kind === 'expired'
+        ? 'The Claude Code login token is stale. It renews as soon as any Claude Code session makes a request: give one a task and send /limits again.'
+        : `Could not get the limits: ${esc(detail)}`,
 }
 
 const TEXTS: Record<Lang, Texts> = { ru: RU, en: EN }

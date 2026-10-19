@@ -802,7 +802,7 @@ setInterval(() => {
   if (process.stdin.destroyed || process.stdin.readableEnded) shutdown()
 }, 5000).unref()
 
-// Bot commands (/start /help /setup /id /status /sessions) — texts and access
+// Bot commands (/start /help /setup /id /status /sessions /limits) — texts and access
 // rules live in bot-ui.ts, shared with tg-router, which answers them itself
 // while it runs. This handler covers polling mode. Strangers get nothing in
 // allowlist mode or in groups that weren't added (no pairing codes leak and
@@ -814,7 +814,7 @@ bot.use(async (ctx, next) => {
   if (!msg || !cmd) return next()
   const thread = threadOf(msg as unknown as AnyMsg)
   const chat_id = String(msg.chat.id)
-  const text = handleCommand(cmd, msg, {
+  const text = await handleCommand(cmd, msg, {
     access: loadAccess(),
     topicName: topicInfo.get(topicKey(chat_id, thread))?.topic ?? topicNameFromMsg(msg as unknown as AnyMsg),
   })

@@ -45,9 +45,16 @@ writeFileSync(join(TMP, 'config.json'), JSON.stringify({
   plugin: { autoPatch: false },
 }))
 mkdirSync(join(TMP, 'dm'), { recursive: true })
+// A Claude Code login for /limits, which then asks the mock instead of Anthropic.
+mkdirSync(join(TMP, 'claude'), { recursive: true })
+writeFileSync(join(TMP, 'claude', '.credentials.json'), JSON.stringify({
+  claudeAiOauth: { accessToken: 'test-oauth', expiresAt: Date.now() + 86400_000, subscriptionType: 'max', rateLimitTier: 'default_claude_max_5x' },
+}))
 
 const env = {
   ...process.env,
+  CLAUDE_CONFIG_DIR: join(TMP, 'claude'),
+  TG_TOPICS_USAGE_URL: `${MOCK}/_usage`,
   TELEGRAM_API_ROOT: MOCK,
   TELEGRAM_STATE_DIR: STATE_TG,
   TG_ROUTER_HOME: join(TMP, 'home'),
@@ -170,7 +177,7 @@ try {
   // ---- M: command menu written on first connect
   const m1 = await menus()
   const ruPrivate = m1.commands['all_private_chats|ru']?.map(c => c.command) ?? []
-  check(['start', 'help', 'setup', 'id', 'status', 'sessions'].every(c => ruPrivate.includes(c)), `private menu (ru) set on first connect: ${ruPrivate.join(' ')}`)
+  check(['start', 'help', 'setup', 'id', 'status', 'sessions', 'limits'].every(c => ruPrivate.includes(c)), `private menu (ru) set on first connect: ${ruPrivate.join(' ')}`)
   check(m1.commands['all_group_chats|']?.some(c => c.command === 'id') && m1.commands['default|']?.length, 'group and default menus set (old menus of a reused bot overwritten)')
   check(marker().bot_id === 999, 'menu marker remembers the bot it was written for')
   const callsAfterFirst = m1.calls
@@ -192,8 +199,14 @@ try {
   await push(cmd(groupMsg(-1001, 10, '/sessions')))
   const sess = await replyTo(-1001, /Сессии Claude/)
   check(sess?.text.includes('Тест группа / Видео монтаж') && sess.text.includes('Личка (основная)'), '/sessions lists running sessions with topic names')
+  await push(cmd(dm(111, '/limits')))
+  const lim = await replyTo(111, /Лимиты Claude/)
+  check(lim?.parse_mode === 'HTML' && lim.text.includes('Max 5x') && lim.text.includes('Неделя, все модели: <b>56%</b>') && lim.text.includes('🔴 Неделя, Fable: <b>93%</b>'),
+    '/limits in DM: plan, usage per limit with a red mark near the cap')
+  await push(cmd(groupMsg(-1001, 20, '/limits', { from: user(222) })))
   await Bun.sleep(1500)
   const all = await sent()
+  check(!all.some(m => Number(m.chat_id) === -1001 && String(m.text).includes('Лимиты Claude')), '/limits from a non-owner group member gets no reply')
   check(!all.some(m => Number(m.chat_id) === -1003 && String(m.text).includes('user222')), 'stranger in an unconnected group gets no reply')
   check(!all.some(m => Number(m.chat_id) === 333), 'stranger DM in allowlist mode: /start ignored')
   check(!sessions().some(s => s.kind === 'inbound' && String(s.data.content).startsWith('/')), 'commands never reach a Claude session')
@@ -220,6 +233,8 @@ try {
   check(fallback?.text.startsWith('echo[dm]'), 'with router down, main session falls back to polling')
   await push(cmd(dm(111, '/sessions')))
   check(await replyTo(111, /Роутер тем не запущен/), 'polling mode: the channel server answers commands itself')
+  await push(cmd(dm(111, '/limits', 'en')))
+  check(await replyTo(111, /Claude usage limits.*Session \(5 h\): <b>5%<\/b>/s), 'polling mode: /limits answered by the channel server too')
 
   router = startRouter()
   await waitFor(async () => { const s = await status(); return s?.sessions?.some((c: any) => c.route === 'dm') ? s : undefined }, 25_000, 'dm hands over to router')

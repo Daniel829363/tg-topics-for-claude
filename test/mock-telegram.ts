@@ -1,6 +1,7 @@
 /**
  * Minimal Telegram Bot API mock for tg-router tests.
  * Control endpoints: POST /_push {update}, GET /_sent, GET /_polls, GET /_commands.
+ * GET /_usage stands in for Anthropic's usage endpoint (/limits) and wants the test token.
  * getMe answers per token: "456:NEW" is a second bot (token-change test).
  * Like the real API, a new getUpdates call terminates the one in flight with 409.
  */
@@ -51,6 +52,19 @@ Bun.serve({
     if (url.pathname === '/_sent') return Response.json(sent)
     if (url.pathname === '/_polls') return Response.json(pollers)
     if (url.pathname === '/_commands') return Response.json({ calls: setCommandsCalls, commands })
+    if (url.pathname === '/_usage') {
+      if (req.headers.get('authorization') !== 'Bearer test-oauth' || !req.headers.get('anthropic-beta')) return new Response('unauthorized', { status: 401 })
+      const at = (h: number) => new Date(Date.now() + h * 3600_000).toISOString()
+      return Response.json({
+        five_hour: { utilization: 5, resets_at: at(2) },
+        seven_day: { utilization: 56, resets_at: at(90) },
+        limits: [
+          { kind: 'session', percent: 5, resets_at: at(2), scope: null },
+          { kind: 'weekly_all', percent: 56, resets_at: at(90), scope: null },
+          { kind: 'weekly_scoped', percent: 93, resets_at: at(90), scope: { model: { id: null, display_name: 'Fable' } } },
+        ],
+      })
+    }
 
     const m = url.pathname.match(/^\/bot([^/]+)\/(\w+)$/)
     if (!m) return new Response('not found', { status: 404 })

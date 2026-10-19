@@ -17,7 +17,7 @@
  * Windows Terminal tab running claude there, queues the message and flushes
  * it once the session connects.
  *
- * Bot commands (/start /help /setup /id /status /sessions) are answered here,
+ * Bot commands (/start /help /setup /id /status /sessions /limits) are answered here,
  * so they work without waking a session. The bot's command menu is written
  * on first connect and whenever the token switches to another bot.
  */
@@ -262,9 +262,12 @@ function sessionList(): SessionItem[] {
 function handleBotCommand(msg: any, route: string): boolean {
   const cmd = parseCommand(msg, botUsername)
   if (!cmd) return false
-  const text = handleCommand(cmd, msg, { access: loadAccess(), topicName: infoFor(route)?.topic, sessions: sessionList() })
-  if (text) notify(String(msg.chat.id), threadOf(msg), text, true)
-  log(`command /${cmd} from ${msg.from?.id} in ${route}: ${text ? 'answered' : 'ignored'}`)
+  void handleCommand(cmd, msg, { access: loadAccess(), topicName: infoFor(route)?.topic, sessions: sessionList() })
+    .then(text => {
+      if (text) notify(String(msg.chat.id), threadOf(msg), text, true)
+      log(`command /${cmd} from ${msg.from?.id} in ${route}: ${text ? 'answered' : 'ignored'}`)
+    })
+    .catch(err => log(`command /${cmd} failed:`, String(err)))
   return true
 }
 
