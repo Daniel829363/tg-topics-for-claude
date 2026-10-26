@@ -1,6 +1,6 @@
 /**
  * tg-topics — the bot's command menu and the texts behind /start, /help,
- * /setup, /id, /status, /sessions and /limits.
+ * /setup, /id, /status, /sessions, /stop, /maxsessions and /limits.
  *
  * Shared by tg-router (which answers commands itself while it runs) and the
  * overlaid telegram channel server (which answers them when no router is
@@ -34,6 +34,8 @@ const PRIVATE_MENU: MenuItem[] = [
   { command: 'id', ru: 'Мой Telegram ID', en: 'My Telegram ID' },
   { command: 'status', ru: 'Есть ли у меня доступ', en: 'My access status' },
   { command: 'sessions', ru: 'Запущенные сессии Claude', en: 'Running Claude sessions' },
+  { command: 'stop', ru: 'Закрыть сессию: /stop N или /stop all', en: 'Close a session: /stop N or /stop all' },
+  { command: 'maxsessions', ru: 'Лимит сессий: /maxsessions 12', en: 'Session limit: /maxsessions 12' },
   { command: 'limits', ru: 'Лимиты Claude: сессия и неделя', en: 'Claude usage limits: session and week' },
 ]
 
@@ -42,10 +44,15 @@ const GROUP_MENU: MenuItem[] = [
   { command: 'id', ru: 'ID группы и темы + команда подключения', en: 'Group and topic ID + connect command' },
   { command: 'setup', ru: 'Команды для терминала', en: 'Terminal commands' },
   { command: 'sessions', ru: 'Запущенные сессии Claude', en: 'Running Claude sessions' },
+  { command: 'stop', ru: 'Закрыть сессию этой темы', en: "Close this topic's session" },
+  { command: 'maxsessions', ru: 'Лимит параллельных сессий', en: 'Parallel session limit' },
   { command: 'limits', ru: 'Лимиты Claude', en: 'Claude usage limits' },
 ]
 
-export const KNOWN_COMMANDS = new Set(['start', 'help', 'setup', 'id', 'status', 'sessions', 'limits'])
+export const KNOWN_COMMANDS = new Set(['start', 'help', 'setup', 'id', 'status', 'sessions', 'stop', 'maxsessions', 'limits'])
+
+/** Upper bound for /maxsessions — every session is a full Claude Code process. */
+export const MAX_SESSIONS_CAP = 50
 
 function menu(items: MenuItem[], lang: Lang): { command: string; description: string }[] {
   return items.map(i => ({ command: i.command, description: i[lang] }))
@@ -139,19 +146,85 @@ export type AccessLike = {
 
 export type SessionItem = { route: string; chat_title?: string; topic?: string; since?: number; starting?: boolean }
 
+/** What the router lets /stop and /maxsessions do. Absent when no router runs. */
+export type RouterControl = {
+  maxSessions: number
+  /** Closes the sessions of these routes; resolves to the routes actually closed. */
+  stop(routes: string[]): Promise<string[]>
+  setMaxSessions(n: number): void
+}
+
 export type CommandEnv = {
   access: AccessLike
   /** Topic name if known (the Bot API can't look it up). */
   topicName?: string
   /** Router's session list; undefined when no router runs (single session). */
   sessions?: SessionItem[]
+  control?: RouterControl
+}
+
+/** The command's argument: "/stop 2" → "2". */
+function argOf(msg: any): string {
+  const text: string = msg?.text ?? ''
+  const len: number = msg?.entities?.[0]?.length ?? text.split(/\s/)[0]!.length
+  return text.slice(len).trim().toLowerCase()
+}
+
+/** The router's name for the chat/topic a message came from. */
+function routeOfMsg(msg: any): string {
+  if (msg.chat.type === 'private') return 'dm'
+  const thread = msg.chat.is_forum && msg.is_topic_message ? msg.message_thread_id : undefined
+  return `${msg.chat.id}:${thread ?? 'main'}`
+}
+
+/**
+ * /stop — "/stop N" closes session N of the /sessions list, "/stop all" every
+ * topic session (the main DM session stays), a bare "/stop" in a topic closes
+ * that topic's session. A closed topic starts again on its next message.
+ */
+async function stopCommand(msg: any, env: CommandEnv, t: Texts): Promise<string> {
+  const list = env.sessions
+  if (!list || !env.control) return t.sessions(undefined)
+  const arg = argOf(msg)
+  let targets: SessionItem[]
+  if (!arg) {
+    if (msg.chat.type === 'private') return t.stopUsage(list)
+    const here = list.find(s => s.route === routeOfMsg(msg))
+    if (!here) return t.stopNone()
+    targets = [here]
+  } else if (arg === 'all') {
+    targets = list.filter(s => s.route !== 'dm')
+    if (!targets.length) return t.stopNone()
+  } else if (/^\d+$/.test(arg) && list[Number(arg) - 1]) {
+    targets = [list[Number(arg) - 1]!]
+  } else {
+    return t.stopUsage(list)
+  }
+  const running = targets.filter(s => !s.starting)
+  if (!running.length) return t.stopStarting()
+  const closed = new Set(await env.control.stop(running.map(s => s.route)))
+  return t.stopped(running.filter(s => closed.has(s.route)), running.filter(s => !closed.has(s.route)))
+}
+
+/** /maxsessions — show the limit, or "/maxsessions 12" to change it. */
+function maxSessionsCommand(msg: any, env: CommandEnv, t: Texts): string {
+  if (!env.sessions || !env.control) return t.sessions(undefined)
+  const arg = argOf(msg)
+  const used = env.sessions.length
+  if (!arg) return t.maxShow(env.control.maxSessions, used)
+  const n = Number(arg)
+  if (!Number.isInteger(n) || n < 1 || n > MAX_SESSIONS_CAP) return t.maxBad(env.control.maxSessions)
+  const old = env.control.maxSessions
+  env.control.setMaxSessions(n)
+  return t.maxSet(n, old, used)
 }
 
 /**
  * HTML reply for a known command, or null to stay silent. Same rules as the
  * channel's gate: strangers get nothing in allowlist mode and in groups that
  * weren't added; in pairing mode they only learn how to ask for access.
- * Async because /limits asks Anthropic for the numbers.
+ * Async because /limits asks Anthropic for the numbers and /stop waits for
+ * the sessions to close.
  */
 export async function handleCommand(cmd: string, msg: any, env: CommandEnv): Promise<string | null> {
   const from = msg?.from
@@ -172,7 +245,9 @@ export async function handleCommand(cmd: string, msg: any, env: CommandEnv): Pro
       case 'setup': return owner ? t.setup(a) : t.startGuest()
       case 'id': return t.idPrivate(sender, from.username, owner ? 'yes' : pending ? 'pending' : 'no')
       case 'status': return owner ? t.statusOwner(from.username ?? sender, a) : t.statusGuest(pending?.[0])
-      case 'sessions': return owner ? t.sessions(env.sessions) : null
+      case 'sessions': return owner ? t.sessions(env.sessions, env.control?.maxSessions) : null
+      case 'stop': return owner ? stopCommand(msg, env, t) : null
+      case 'maxsessions': return owner ? maxSessionsCommand(msg, env, t) : null
       case 'limits': return owner ? limitsText(lang) : null
     }
     return null
@@ -203,7 +278,11 @@ export async function handleCommand(cmd: string, msg: any, env: CommandEnv): Pro
       case 'setup':
         return owner ? t.setup(a) : t.help(env.sessions !== undefined)
       case 'sessions':
-        return owner ? t.sessions(env.sessions) : null
+        return owner ? t.sessions(env.sessions, env.control?.maxSessions) : null
+      case 'stop':
+        return owner ? stopCommand(msg, env, t) : null
+      case 'maxsessions':
+        return owner ? maxSessionsCommand(msg, env, t) : null
       case 'limits':
         return owner ? limitsText(lang) : null
     }
@@ -315,7 +394,14 @@ type Texts = {
   idGroup(g: GroupInfo): string
   statusOwner(name: string, a: AccessLike): string
   statusGuest(code?: string): string
-  sessions(list?: SessionItem[]): string
+  sessions(list?: SessionItem[], max?: number): string
+  stopUsage(list: SessionItem[]): string
+  stopNone(): string
+  stopStarting(): string
+  stopped(closed: SessionItem[], failed: SessionItem[]): string
+  maxShow(max: number, used: number): string
+  maxSet(max: number, old: number, used: number): string
+  maxBad(max: number): string
   limits(plan: string, rows: LimitRow[]): string
   limitsError(kind: 'login' | 'expired' | 'failed', detail?: string): string
 }
@@ -323,6 +409,13 @@ type Texts = {
 function sessionName(s: SessionItem, lang: Lang): string {
   if (s.route === 'dm') return lang === 'ru' ? 'Личка (основная)' : 'Direct messages (main)'
   return esc(`${s.chat_title ?? ''} / ${s.topic ?? s.route}`)
+}
+
+/** "1. 🟢 Group / Topic — since 10:40" — the numbers /stop takes. */
+function sessionLines(list: SessionItem[], lang: Lang): string[] {
+  return list.map((s, i) => `${i + 1}. ${s.starting
+    ? `⏳ ${sessionName(s, lang)} — ${lang === 'ru' ? 'запускается' : 'starting'}`
+    : `🟢 ${sessionName(s, lang)} — ${lang === 'ru' ? 'с' : 'since'} ${time(s.since, lang)}`}`)
 }
 
 function time(ms: number | undefined, lang: Lang): string {
@@ -363,6 +456,8 @@ const RU: Texts = {
     '/setup — что вводить в терминал: группы, люди, токен',
     '/id — твой ID',
     '/sessions — запущенные сессии',
+    '/stop — закрыть сессию',
+    '/maxsessions — лимит сессий',
     '/limits — лимиты Claude',
   ].join('\n'),
 
@@ -397,7 +492,9 @@ const RU: Texts = {
     '/setup — команды для терминала: подключить группу, человека, сменить токен',
     '/id — ID твой, группы и темы',
     '/status — есть ли у тебя доступ',
-    '/sessions — запущенные сессии Claude',
+    '/sessions — запущенные сессии Claude (с номерами)',
+    '/stop N — закрыть сессию N из /sessions; /stop all — все темы; /stop в теме — её сессию',
+    '/maxsessions — лимит параллельных сессий; /maxsessions 12 — поменять',
     '/limits — сколько лимита Claude израсходовано и когда сброс',
     '',
     'Текст в рамке копируется нажатием.',
@@ -431,6 +528,8 @@ const RU: Texts = {
     '<b>Сессии и роутер</b>',
     `${code('/tg-topics:router status')} — роутер, сессии, автозапуск`,
     `${code('/tg-topics:router restart')} — перезапуск роутера (сессии переподключатся сами)`,
+    `${code('/tg-topics:router close N')} — закрыть сессию N (${code('close all')} — все темы)`,
+    `${code('/tg-topics:router max 12')} — лимит параллельных сессий`,
     `${code('/tg-topics:help')} — эта справка в терминале`,
     '',
     '<b>Прочее</b>',
@@ -474,11 +573,37 @@ const RU: Texts = {
     ? `⏳ Ждёт подтверждения. Владелец вводит в терминале Claude Code:\n${code(`/telegram:access pair ${c}`)}`
     : '❌ Доступа нет. Отправь /id и передай ID владельцу бота или напиши любое сообщение — придёт код подтверждения.',
 
-  sessions: list => {
+  sessions: (list, max) => {
     if (!list) return `Роутер тем не запущен — все чаты обслуживает одна сессия.\nЗапуск в терминале: ${code('/tg-topics:router start')}`
-    if (!list.length) return 'Нет запущенных сессий. Сессия запустится сама на первое сообщение.'
-    return ['🖥 <b>Сессии Claude</b>', ...list.map(s => s.starting ? `⏳ ${sessionName(s, 'ru')} — запускается` : `🟢 ${sessionName(s, 'ru')} — с ${time(s.since, 'ru')}`)].join('\n')
+    const limit = max ? ` · ${list.length} из ${max}` : ''
+    if (!list.length) return `Нет запущенных сессий${limit}. Сессия запустится сама на первое сообщение.`
+    return [`🖥 <b>Сессии Claude</b>${limit}`, ...sessionLines(list, 'ru'), '', `Закрыть: ${code('/stop N')} · все темы: ${code('/stop all')}`].join('\n')
   },
+
+  stopUsage: list => list.length
+    ? ['Какую сессию закрыть? Отправь номер:', '', ...sessionLines(list, 'ru'), '', `${code('/stop 2')} — сессию №2 · ${code('/stop all')} — все темы (личка остаётся) · ${code('/stop')} в теме — её сессию`].join('\n')
+    : 'Нет запущенных сессий.',
+
+  stopNone: () => 'Здесь нет запущенной сессии — закрывать нечего.',
+
+  stopStarting: () => 'Сессия ещё запускается — подожди, пока она подключится, и повтори /stop.',
+
+  stopped: (closed, failed) => [
+    ...(closed.length ? [`⏹ Закрыл: ${closed.map(s => sessionName(s, 'ru')).join(', ')}.`, 'Новое сообщение в теме снова запустит её сессию — память и инструкции сохранены.'] : []),
+    ...(failed.length ? [`⚠️ Не удалось закрыть: ${failed.map(s => sessionName(s, 'ru')).join(', ')} — закрой вкладку в окне Windows Terminal вручную.`] : []),
+  ].join('\n'),
+
+  maxShow: (max, used) => [
+    `🔢 Лимит параллельных сессий: <b>${max}</b>, занято: ${used}.`,
+    `Поменять: ${code('/maxsessions 12')} (от 1 до ${MAX_SESSIONS_CAP}). Каждая сессия — отдельный Claude Code: больше памяти компьютера и быстрее расходуются лимиты Claude.`,
+  ].join('\n'),
+
+  maxSet: (max, old, used) => [
+    `✅ Лимит сессий: ${old} → <b>${max}</b>. Занято сейчас: ${used}.`,
+    ...(used > max ? [`Лишние сессии работают дальше, новые не запустятся, пока их не станет меньше ${max}. Закрыть: /stop N.`] : []),
+  ].join('\n'),
+
+  maxBad: max => `Нужно число от 1 до ${MAX_SESSIONS_CAP}, например ${code('/maxsessions 12')}. Сейчас лимит: ${max}.`,
 
   limits: (plan, rows) => [
     `📊 <b>Лимиты Claude</b>${plan ? ` · ${esc(plan)}` : ''}`,
@@ -511,6 +636,8 @@ const EN: Texts = {
     '/setup — terminal commands: groups, people, token',
     '/id — your ID',
     '/sessions — running sessions',
+    '/stop — close a session',
+    '/maxsessions — session limit',
     '/limits — Claude usage limits',
   ].join('\n'),
 
@@ -545,7 +672,9 @@ const EN: Texts = {
     '/setup — terminal commands: add a group or a person, change the token',
     '/id — your, group and topic IDs',
     '/status — your access status',
-    '/sessions — running Claude sessions',
+    '/sessions — running Claude sessions (numbered)',
+    '/stop N — close session N from /sessions; /stop all — every topic; /stop in a topic — its session',
+    '/maxsessions — parallel session limit; /maxsessions 12 — change it',
     '/limits — how much of the Claude usage limits is used and when they reset',
     '',
     'Tap any boxed text to copy it.',
@@ -579,6 +708,8 @@ const EN: Texts = {
     '<b>Sessions and router</b>',
     `${code('/tg-topics:router status')} — router, sessions, autostart`,
     `${code('/tg-topics:router restart')} — restart the router (sessions reconnect on their own)`,
+    `${code('/tg-topics:router close N')} — close session N (${code('close all')} — every topic)`,
+    `${code('/tg-topics:router max 12')} — parallel session limit`,
     `${code('/tg-topics:help')} — this guide in the terminal`,
     '',
     '<b>Other</b>',
@@ -622,11 +753,37 @@ const EN: Texts = {
     ? `⏳ Waiting for approval. The owner types in the Claude Code terminal:\n${code(`/telegram:access pair ${c}`)}`
     : "❌ No access. Send /id and give the ID to the bot owner, or send any message to get a pairing code.",
 
-  sessions: list => {
+  sessions: (list, max) => {
     if (!list) return `The topic router is not running — one session serves every chat.\nStart it in the terminal: ${code('/tg-topics:router start')}`
-    if (!list.length) return 'No running sessions. One starts on the first message.'
-    return ['🖥 <b>Claude sessions</b>', ...list.map(s => s.starting ? `⏳ ${sessionName(s, 'en')} — starting` : `🟢 ${sessionName(s, 'en')} — since ${time(s.since, 'en')}`)].join('\n')
+    const limit = max ? ` · ${list.length} of ${max}` : ''
+    if (!list.length) return `No running sessions${limit}. One starts on the first message.`
+    return [`🖥 <b>Claude sessions</b>${limit}`, ...sessionLines(list, 'en'), '', `Close: ${code('/stop N')} · every topic: ${code('/stop all')}`].join('\n')
   },
+
+  stopUsage: list => list.length
+    ? ['Which session should I close? Send its number:', '', ...sessionLines(list, 'en'), '', `${code('/stop 2')} — session #2 · ${code('/stop all')} — every topic (DMs stay) · ${code('/stop')} in a topic — its session`].join('\n')
+    : 'No running sessions.',
+
+  stopNone: () => 'No session is running here — nothing to close.',
+
+  stopStarting: () => 'That session is still starting — wait for it to connect and send /stop again.',
+
+  stopped: (closed, failed) => [
+    ...(closed.length ? [`⏹ Closed: ${closed.map(s => sessionName(s, 'en')).join(', ')}.`, 'A new message in the topic starts its session again — memory and instructions are kept.'] : []),
+    ...(failed.length ? [`⚠️ Could not close: ${failed.map(s => sessionName(s, 'en')).join(', ')} — close its tab in Windows Terminal by hand.`] : []),
+  ].join('\n'),
+
+  maxShow: (max, used) => [
+    `🔢 Parallel session limit: <b>${max}</b>, in use: ${used}.`,
+    `Change it: ${code('/maxsessions 12')} (1 to ${MAX_SESSIONS_CAP}). Each session is a separate Claude Code: more memory on the computer and faster use of the Claude limits.`,
+  ].join('\n'),
+
+  maxSet: (max, old, used) => [
+    `✅ Session limit: ${old} → <b>${max}</b>. In use now: ${used}.`,
+    ...(used > max ? [`The extra sessions keep running; new ones won't start until fewer than ${max} are open. Close one: /stop N.`] : []),
+  ].join('\n'),
+
+  maxBad: max => `Send a number from 1 to ${MAX_SESSIONS_CAP}, e.g. ${code('/maxsessions 12')}. The limit now: ${max}.`,
 
   limits: (plan, rows) => [
     `📊 <b>Claude usage limits</b>${plan ? ` · ${esc(plan)}` : ''}`,

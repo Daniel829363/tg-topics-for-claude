@@ -177,7 +177,7 @@ try {
   // ---- M: command menu written on first connect
   const m1 = await menus()
   const ruPrivate = m1.commands['all_private_chats|ru']?.map(c => c.command) ?? []
-  check(['start', 'help', 'setup', 'id', 'status', 'sessions', 'limits'].every(c => ruPrivate.includes(c)), `private menu (ru) set on first connect: ${ruPrivate.join(' ')}`)
+  check(['start', 'help', 'setup', 'id', 'status', 'sessions', 'stop', 'maxsessions', 'limits'].every(c => ruPrivate.includes(c)), `private menu (ru) set on first connect: ${ruPrivate.join(' ')}`)
   check(m1.commands['all_group_chats|']?.some(c => c.command === 'id') && m1.commands['default|']?.length, 'group and default menus set (old menus of a reused bot overwritten)')
   check(marker().bot_id === 999, 'menu marker remembers the bot it was written for')
   const callsAfterFirst = m1.calls
@@ -249,6 +249,42 @@ try {
   check(switched && (await menus()).calls > callsAfterFirst, 'new bot token → command menu written for the new bot')
   const health = await (await fetch(`${ROUTER}/health`)).json() as any
   check(health.bot === 'new_bot', `router now polls as the new bot (@${health.bot})`)
+
+  // ---- E: /stop closes sessions, /maxsessions changes the limit
+  await push(cmd(dm(111, '/sessions')))
+  const numbered = await replyTo(111, /Сессии Claude<\/b> · 4 из 8/)
+  check(numbered?.text.includes('1. 🟢') && numbered.text.includes('/stop N'), '/sessions numbers the sessions and shows "4 of 8"')
+  await push(cmd(groupMsg(-1001, 20, '/stop')))
+  const stopped = await replyTo(-1001, /Закрыл: Тест группа \/ Сценарии/, 20_000)
+  check(stopped?.message_thread_id == 20, '/stop in a topic closes that topic\'s session, reply in its thread')
+  check(!(await status())?.sessions?.some((s: any) => s.route === '-1001:20'), 'the closed session is gone from the router')
+  await push(cmd(dm(111, '/stop 99')))
+  check(await replyTo(111, /Какую сессию закрыть/), '/stop with a wrong number shows the numbered list')
+  await push(cmd(groupMsg(-1001, 10, '/stop', { from: user(222) })))
+  await push(cmd(dm(111, '/maxsessions 0')))
+  check(await replyTo(111, /Нужно число от 1 до 50/), '/maxsessions rejects 0')
+  await push(cmd(dm(111, '/maxsessions 3')))
+  check(await replyTo(111, /Лимит сессий: 8 → <b>3<\/b>/), '/maxsessions 3 changes the limit')
+  const savedCfg = JSON.parse(readFileSync(join(TMP, 'config.json'), 'utf8'))
+  check(savedCfg.maxSessions === 3 && savedCfg.port === 18789, 'new limit saved to config.json, other settings kept')
+  await push(groupMsg(-1001, 30, 'новая тема при лимите'))
+  const limitNotice = await replyTo(-1001, /Лимит параллельных сессий \(3\) исчерпан.*\/maxsessions 7/s)
+  check(limitNotice?.message_thread_id == 30, 'at the limit a new topic gets a notice with /stop and /maxsessions')
+  check(!sessions().some(s => s.kind === 'spawned' && s.route === '-1001:30'), 'no session spawned over the limit')
+  check((await status())?.sessions?.some((s: any) => s.route === '-1001:10'), 'a non-owner\'s /stop closed nothing')
+
+  const tgt = (...args: string[]) => {
+    const r = Bun.spawnSync(['bun', join(PLUGIN, 'scripts', 'tgt.ts'), ...args], { env, stdout: 'pipe', stderr: 'pipe' })
+    return { code: r.exitCode, out: r.stdout.toString() + r.stderr.toString() }
+  }
+  const tmax = tgt('max', '5')
+  check(tmax.code === 0 && (await status())?.maxSessions === 5, `terminal: tgt max 5 → router limit 5 (${tmax.out.trim()})`)
+  const tclose = tgt('close', '-1001:10')
+  check(tclose.code === 0 && tclose.out.includes('закрыта') && !(await status())?.sessions?.some((s: any) => s.route === '-1001:10'), `terminal: tgt close <route> (${tclose.out.trim()})`)
+  check((await fetch(`${ROUTER}/control`, { method: 'POST', body: JSON.stringify({ maxSessions: 9 }) })).status === 403, '/control without the secret is refused')
+  await push(groupMsg(-1001, 20, 'тема снова'))
+  const again = await waitFor(async () => (await sent()).find(m => String(m.text).endsWith('тема снова')), 60_000, 'closed topic restarts')
+  check(again?.text.startsWith('echo[-1001:20]'), 'a closed topic starts a new session on its next message')
 } finally {
   router.kill()
   for (const s of sessions().filter(s => s.kind === 'spawned')) { try { process.kill(s.pid) } catch {} }

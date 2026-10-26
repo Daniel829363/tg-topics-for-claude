@@ -6,6 +6,8 @@
  *   bun tgt.ts status                                         what runs, what's missing
  *   bun tgt.ts start | stop | restart                         the router
  *   bun tgt.ts logs [lines]                                   tail the router log
+ *   bun tgt.ts close N | all | <route>                        close a Claude session (N from status)
+ *   bun tgt.ts max [N]                                        show / set the parallel session limit
  *   bun tgt.ts autostart on|off                               start the router at Windows sign-in
  *   bun tgt.ts commands [--force]                             sync the bot's command menu now
  *   bun tgt.ts patch | unpatch                                apply / remove the overlay on the official plugin
@@ -17,11 +19,11 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync, copyFileSyn
 import { join, resolve } from 'path'
 import { spawn } from 'child_process'
 import {
-  loadConfig, defaultConfig, applyOverlay, removeOverlay, overlayState, installsOf, readToken, routerHttp, secretFile, writeIfChanged,
+  loadConfig, defaultConfig, applyOverlay, removeOverlay, overlayState, installsOf, readToken, routerHttp, secretFile, writeIfChanged, updateConfigFile,
   PLUGIN_ROOT, PLUGIN_VERSION, HOME, CONFIG_FILE, LOG_FILE, CLAUDE_DIR, SESSION_SETTINGS, INSTALLED_PLUGINS, OFFICIAL_KEY,
   type Config,
 } from '../lib/common.ts'
-import { ensureBotCommands, apiCaller, setupGuide, langOf, COMMANDS_MARKER, type AccessLike } from '../overlay/bot-ui.ts'
+import { ensureBotCommands, apiCaller, setupGuide, langOf, COMMANDS_MARKER, MAX_SESSIONS_CAP, type AccessLike } from '../overlay/bot-ui.ts'
 
 const IS_WIN = process.platform === 'win32'
 const API_ROOT = (process.env.TELEGRAM_API_ROOT ?? 'https://api.telegram.org').replace(/\/+$/, '')
@@ -143,10 +145,13 @@ async function startRouter(): Promise<boolean> {
   return waitFor(true, 15_000)
 }
 
+function routerSecret(): string {
+  try { return readFileSync(secretFile(cfg), 'utf8').trim() } catch { return '' }
+}
+
 async function stopRouter(): Promise<boolean> {
   if (!(await health())) return true
-  let secret = ''
-  try { secret = readFileSync(secretFile(cfg), 'utf8').trim() } catch {}
+  const secret = routerSecret()
   try {
     await fetch(`${routerHttp(cfg)}/shutdown`, { method: 'POST', headers: { 'x-tg-router-secret': secret }, signal: AbortSignal.timeout(2000) })
   } catch {}
@@ -160,6 +165,74 @@ async function stopRouter(): Promise<boolean> {
     Bun.spawnSync(['sh', '-c', `kill $(lsof -t -iTCP:${cfg.port} -sTCP:LISTEN) 2>/dev/null`])
   }
   return waitFor(false, 5000)
+}
+
+// ---- Sessions -------------------------------------------------------------------
+
+async function routerStatus(): Promise<any | null> {
+  try { return await (await fetch(`${routerHttp(cfg)}/status`, { signal: AbortSignal.timeout(3000) })).json() } catch { return null }
+}
+
+/** Same order as the bot's /sessions, so the numbers match. */
+function sessionRoutes(st: any): { route: string; label: string; starting?: boolean }[] {
+  const label = (s: any) => (s.route === 'dm' ? 'личка (основная)' : `${s.chat_title ?? ''} / ${s.topic ?? s.route}`)
+  return [
+    ...(st.sessions ?? []).map((s: any) => ({ route: s.route, label: label(s) })),
+    ...(st.starting ?? []).map((r: string) => ({ route: r, label: r, starting: true })),
+  ]
+}
+
+async function closeSessions(arg: string | undefined): Promise<number> {
+  const st = await routerStatus()
+  if (!st) { say('❌ роутер не запущен — закрывать нечего'); return 1 }
+  const list = sessionRoutes(st)
+  let targets: typeof list
+  if (arg === 'all') targets = list.filter(s => s.route !== 'dm')
+  else if (arg && /^\d+$/.test(arg) && list[Number(arg) - 1]) targets = [list[Number(arg) - 1]!]
+  else if (arg && list.some(s => s.route === arg)) targets = list.filter(s => s.route === arg)
+  else {
+    say('какую сессию закрыть? tgt close N | all | <route>', ...list.map((s, i) => `  ${i + 1}. ${s.starting ? '⏳' : '🟢'} ${s.label}  [${s.route}]`))
+    return 1
+  }
+  targets = targets.filter(s => !s.starting)
+  if (!targets.length) { say('нет подходящих запущенных сессий'); return 1 }
+  const res = await fetch(`${routerHttp(cfg)}/control`, {
+    method: 'POST',
+    headers: { 'x-tg-router-secret': routerSecret(), 'content-type': 'application/json' },
+    body: JSON.stringify({ stop: targets.map(s => s.route) }),
+    signal: AbortSignal.timeout(30_000),
+  })
+  if (!res.ok) { say(`❌ роутер ответил ${res.status} (старая версия? → /tg-topics:router restart)`); return 1 }
+  const closed = new Set(((await res.json()) as { closed: string[] }).closed)
+  for (const s of targets) say(closed.has(s.route) ? `⏹ закрыта: ${s.label}` : `⚠️ не закрылась: ${s.label} — закрой вкладку вручную`)
+  return targets.every(s => closed.has(s.route)) ? 0 : 1
+}
+
+async function maxSessions(arg: string | undefined): Promise<number> {
+  if (arg == null) {
+    const st = await routerStatus()
+    say(`лимит параллельных сессий: ${st?.maxSessions ?? cfg.maxSessions}${st ? `, занято: ${sessionRoutes(st).length}` : ''}`)
+    return 0
+  }
+  const n = Number(arg)
+  if (!Number.isInteger(n) || n < 1 || n > MAX_SESSIONS_CAP) { say(`нужно число от 1 до ${MAX_SESSIONS_CAP}`); return 1 }
+  if (await health()) {
+    const res = await fetch(`${routerHttp(cfg)}/control`, {
+      method: 'POST',
+      headers: { 'x-tg-router-secret': routerSecret(), 'content-type': 'application/json' },
+      body: JSON.stringify({ maxSessions: n }),
+      signal: AbortSignal.timeout(5000),
+    }).catch(() => null)
+    if (res?.ok) {
+      const r = (await res.json()) as { old: number }
+      say(`✅ лимит сессий: ${r.old} → ${n} (роутер применил сразу)`)
+      return 0
+    }
+  }
+  const old = cfg.maxSessions
+  updateConfigFile({ maxSessions: n })
+  say(`✅ лимит сессий: ${old} → ${n} (записан в ${CONFIG_FILE}; запущенный роутер старой версии подхватит после /tg-topics:router restart)`)
+  return 0
 }
 
 // ---- Settings -------------------------------------------------------------------
@@ -344,9 +417,10 @@ async function status(): Promise<void> {
     say(`Роутер:       ${h.version === PLUGIN_VERSION ? '✅' : '⚠️'} работает${h.version ? ` (v${h.version}, pid ${h.pid})` : ' (старая версия → /tg-topics:router restart)'}`)
     try {
       const st = (await (await fetch(`${routerHttp(cfg)}/status`)).json()) as any
-      for (const s of st.sessions ?? []) say(`  🟢 ${s.route === 'dm' ? 'личка (основная)' : `${s.chat_title ?? ''} / ${s.topic ?? s.route}`} — ${s.dir ?? ''}`)
-      for (const s of st.starting ?? []) say(`  ⏳ ${s} — запускается`)
-      if (!(st.sessions ?? []).length && !(st.starting ?? []).length) say('  сессий нет — запустятся на первое сообщение')
+      const list = sessionRoutes(st)
+      say(`Сессии:       ${list.length} из ${st.maxSessions ?? cfg.maxSessions} (закрыть: close N, лимит: max N)`)
+      list.forEach((s, i) => say(`  ${i + 1}. ${s.starting ? '⏳' : '🟢'} ${s.label}${s.starting ? ' — запускается' : ` — ${st.sessions.find((c: any) => c.route === s.route)?.dir ?? ''}`}`))
+      if (!list.length) say('  сессий нет — запустятся на первое сообщение')
     } catch {}
   }
   if (IS_WIN) say(`Автозапуск:   ${existsSync(STARTUP_VBS) ? '✅ при входе в Windows' : '❌ выключен → /tg-topics:router autostart on'}`)
@@ -404,6 +478,12 @@ try {
       try { say(readFileSync(LOG_FILE, 'utf8').trimEnd().split('\n').slice(-n).join('\n')) } catch { say(`лога пока нет: ${LOG_FILE}`) }
       break
     }
+    case 'close':
+      code = await closeSessions(rest[0])
+      break
+    case 'max':
+      code = await maxSessions(rest[0])
+      break
     case 'autostart':
       if (!IS_WIN) { say('автозапуск настраивается только на Windows; на macOS/Linux добавь `bun ' + LAUNCH_TS + '` в автозагрузку сам'); break }
       if (rest[0] === 'off') {
@@ -435,7 +515,7 @@ try {
       try { await hookStart() } catch {}
       break
     default:
-      say('команды: setup | status | start | stop | restart | logs [n] | autostart on|off | commands [--force] | patch | unpatch | guide [ru|en]')
+      say('команды: setup | status | start | stop | restart | logs [n] | close N|all | max [N] | autostart on|off | commands [--force] | patch | unpatch | guide [ru|en]')
       code = 1
   }
 } catch (err) {

@@ -7,7 +7,7 @@
  *   launch-router.ts + start-router.vbs (autostart launchers).
  */
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync, copyFileSync, rmSync } from 'fs'
+import { readFileSync, writeFileSync, mkdirSync, existsSync, copyFileSync, rmSync, renameSync } from 'fs'
 import { join, resolve } from 'path'
 import { homedir } from 'os'
 import { createHash } from 'crypto'
@@ -92,6 +92,15 @@ export function loadConfig(): Config {
     plugin: { ...d.plugin, ...(user.plugin ?? {}) },
     telegramStateDir: process.env.TELEGRAM_STATE_DIR ?? user.telegramStateDir ?? d.telegramStateDir,
   }
+}
+
+/** Changes a few fields of config.json, keeping everything else the user wrote. */
+export function updateConfigFile(patch: Partial<Config>): void {
+  let user: Record<string, unknown> = {}
+  try { user = JSON.parse(readFileSync(CONFIG_FILE, 'utf8')) } catch {}
+  mkdirSync(resolve(CONFIG_FILE, '..'), { recursive: true })
+  writeFileSync(CONFIG_FILE + '.tmp', JSON.stringify({ ...user, ...patch }, null, 2) + '\n')
+  renameSync(CONFIG_FILE + '.tmp', CONFIG_FILE)
 }
 
 export function routerHttp(cfg: Config): string {

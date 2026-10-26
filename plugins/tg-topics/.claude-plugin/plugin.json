@@ -1,7 +1,7 @@
 {
   "name": "tg-topics",
-  "version": "1.1.0",
-  "description": "Add-on for the official Telegram channel (telegram@claude-plugins-official): routes every forum topic to its own Claude Code session with its own instructions and memory, keeps the bot command menu in sync, adds /help, /setup, /id, /sessions and /limits to the bot.",
+  "version": "1.2.0",
+  "description": "Add-on for the official Telegram channel (telegram@claude-plugins-official): routes every forum topic to its own Claude Code session with its own instructions and memory, keeps the bot command menu in sync, adds /help, /setup, /id, /sessions, /stop, /maxsessions and /limits to the bot.",
   "author": {
     "name": "Daniel829363",
     "url": "https://github.com/Daniel829363"

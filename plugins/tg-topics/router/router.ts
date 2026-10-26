@@ -17,18 +17,18 @@
  * Windows Terminal tab running claude there, queues the message and flushes
  * it once the session connects.
  *
- * Bot commands (/start /help /setup /id /status /sessions /limits) are answered here,
- * so they work without waking a session. The bot's command menu is written
+ * Bot commands (/start /help /setup /id /status /sessions /stop /maxsessions
+ * /limits) are answered here, so they work without waking a session. The bot's command menu is written
  * on first connect and whenever the token switches to another bot.
  */
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync, appendFileSync, renameSync, statSync } from 'fs'
+import { readFileSync, writeFileSync, mkdirSync, existsSync, appendFileSync, renameSync, statSync, rmSync } from 'fs'
 import { join, dirname } from 'path'
 import { randomBytes } from 'crypto'
 import { spawn } from 'child_process'
 import type { ServerWebSocket } from 'bun'
-import { loadConfig, applyOverlay, readToken, secretFile, PLUGIN_VERSION, STATE, LOG_FILE, CONFIG_FILE } from '../lib/common.ts'
-import { parseCommand, handleCommand, ensureBotCommands, type AccessLike, type SessionItem } from '../overlay/bot-ui.ts'
+import { loadConfig, applyOverlay, readToken, secretFile, updateConfigFile, PLUGIN_VERSION, STATE, LOG_FILE, CONFIG_FILE } from '../lib/common.ts'
+import { parseCommand, handleCommand, ensureBotCommands, MAX_SESSIONS_CAP, type AccessLike, type SessionItem, type RouterControl } from '../overlay/bot-ui.ts'
 
 const TEMPLATES = join(import.meta.dir, 'templates')
 const cfg = loadConfig()
@@ -258,11 +258,17 @@ function sessionList(): SessionItem[] {
   ]
 }
 
+const control: RouterControl = {
+  get maxSessions() { return cfg.maxSessions },
+  stop: routes => stopSessions(routes),
+  setMaxSessions,
+}
+
 /** Answer a bot command here. Returns true when the message was a command (handled or ignored). */
 function handleBotCommand(msg: any, route: string): boolean {
   const cmd = parseCommand(msg, botUsername)
   if (!cmd) return false
-  void handleCommand(cmd, msg, { access: loadAccess(), topicName: infoFor(route)?.topic, sessions: sessionList() })
+  void handleCommand(cmd, msg, { access: loadAccess(), topicName: infoFor(route)?.topic, sessions: sessionList(), control })
     .then(text => {
       if (text) notify(String(msg.chat.id), threadOf(msg), text, true)
       log(`command /${cmd} from ${msg.from?.id} in ${route}: ${text ? 'answered' : 'ignored'}`)
@@ -367,6 +373,12 @@ function dropLegacyTopicHook(dir: string): void {
 
 type Workspace = { dir: string; launcher: string; title: string; env: Record<string, string> }
 
+function launcherPath(route: string): string | undefined {
+  if (route === 'dm') return join(STATE, 'launch', 'dm.ps1')
+  const entry = routes[route]
+  return entry && join(entry.dir, '.tg', 'start.ps1')
+}
+
 function prepareWorkspace(route: string): Workspace {
   const routerUrl = `ws://127.0.0.1:${cfg.port}/ws`
   const env: Record<string, string> = { TELEGRAM_ROUTE: route, TELEGRAM_ROUTER_URL: routerUrl }
@@ -383,7 +395,7 @@ function prepareWorkspace(route: string): Workspace {
     dir = cfg.dm.dir
     title = 'TG · DM'
     sessionName = 'TG: DM'
-    launcher = join(STATE, 'launch', 'dm.ps1')
+    launcher = launcherPath(route)!
   } else {
     const { chat_id, thread } = parseRoute(route)
     const info = infoFor(route) ?? {}
@@ -402,7 +414,7 @@ function prepareWorkspace(route: string): Workspace {
     env.TELEGRAM_TOPIC_DIR = dir
     title = `TG · ${topicName}`
     sessionName = `TG: ${chatTitle} / ${topicName}`
-    launcher = join(dir, '.tg', 'start.ps1')
+    launcher = launcherPath(route)!
 
     mkdirSync(join(dir, '.tg'), { recursive: true })
     const vars = {
@@ -430,8 +442,12 @@ function prepareWorkspace(route: string): Workspace {
     ...Object.entries(env).map(([k, v]) => `$env:${k} = ${psQuote(v)}`),
     `Set-Location -LiteralPath ${psQuote(dir)}`,
     `& ${psQuote(cfg.claudeExe)} ${args}`,
+    '# Closed with /stop: close the tab too (exit code 0, so Windows Terminal does).',
+    `$stopFlag = ${psQuote(stopFlag(route))}`,
+    'if (Test-Path -LiteralPath $stopFlag) { Remove-Item -LiteralPath $stopFlag -Force; [Environment]::Exit(0) }',
   ].join('\r\n')
   mkdirSync(dirname(launcher), { recursive: true })
+  rmSync(stopFlag(route), { force: true })
   // BOM so Windows PowerShell 5.1 reads non-ASCII topic names as UTF-8.
   writeFileSync(launcher, '﻿' + ps1 + '\r\n')
   return { dir, launcher, title, env }
@@ -465,7 +481,7 @@ function startSession(route: string, msg: any): void {
   if (route === 'dm' && !cfg.dm.spawn) return
   if (clients.size + pending.size >= cfg.maxSessions) {
     log(`not starting ${route}: session limit ${cfg.maxSessions} reached`)
-    notify(target, thread, `⚠️ Лимит параллельных сессий (${cfg.maxSessions}) исчерпан — закрой ненужные вкладки или увеличь maxSessions в ${CONFIG_FILE}.`)
+    notify(target, thread, `⚠️ Лимит параллельных сессий (${cfg.maxSessions}) исчерпан. Закрой ненужную: /sessions → /stop N, или подними лимит: /maxsessions ${Math.min(cfg.maxSessions + 4, MAX_SESSIONS_CAP)}. Потом повтори сообщение.`)
     queues.delete(route)
     return
   }
@@ -483,6 +499,94 @@ function startSession(route: string, msg: any): void {
     log(`failed to start session for ${route}:`, String(err))
     notify(target, thread, `⚠️ Не удалось запустить сессию: ${err}`)
   }
+}
+
+// ---- Closing sessions and the session limit ---------------------------------
+
+type Proc = { pid: number; ppid: number; name: string; cmd: string }
+
+/** Marker the launcher looks for once claude exits: present = closed by /stop. */
+function stopFlag(route: string): string {
+  return join(STATE, 'stop', route.replace(/[^\w-]/g, '_'))
+}
+
+async function processTable(): Promise<Map<number, Proc>> {
+  const table = new Map<number, Proc>()
+  try {
+    if (process.platform === 'win32') {
+      const p = Bun.spawn(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command',
+        'Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,CommandLine | ConvertTo-Json -Compress'], { stdout: 'pipe', stderr: 'ignore' })
+      for (const r of JSON.parse(await new Response(p.stdout).text()) as any[]) {
+        table.set(r.ProcessId, { pid: r.ProcessId, ppid: r.ParentProcessId, name: String(r.Name ?? ''), cmd: String(r.CommandLine ?? '') })
+      }
+    } else {
+      const p = Bun.spawn(['ps', '-A', '-o', 'pid=,ppid=,comm='], { stdout: 'pipe', stderr: 'ignore' })
+      for (const line of (await new Response(p.stdout).text()).split('\n')) {
+        const m = line.match(/^\s*(\d+)\s+(\d+)\s+(.+?)\s*$/)
+        if (m) table.set(Number(m[1]), { pid: Number(m[1]), ppid: Number(m[2]), name: m[3]!.split('/').pop()!, cmd: m[3]! })
+      }
+    }
+  } catch (err) {
+    log('process list failed:', String(err))
+  }
+  return table
+}
+
+/** The claude process that runs a session's channel server (a few bun wrappers up). */
+function claudeOf(table: Map<number, Proc>, pid: number): Proc | undefined {
+  for (let p = table.get(pid), i = 0; p && i < 6; p = table.get(p.ppid), i++) {
+    if (/^claude(\.exe)?$/i.test(p.name)) return p
+  }
+  return undefined
+}
+
+async function killTree(pid: number): Promise<void> {
+  try {
+    if (process.platform === 'win32') await Bun.spawn(['taskkill', '/PID', String(pid), '/T', '/F'], { stdout: 'ignore', stderr: 'ignore' }).exited
+    else process.kill(pid, 'SIGTERM')
+  } catch {}
+}
+
+/**
+ * Closes sessions: kills each one's claude process (or, when it can't be
+ * found, the channel server, which at least frees the route). The launcher
+ * then sees its stop flag and closes the terminal tab. Resolves to the routes
+ * whose session disconnected.
+ */
+async function stopSessions(list: string[]): Promise<string[]> {
+  const targets = list.map(r => clients.get(r)).filter((c): c is Client => !!c)
+  if (!targets.length) return []
+  const table = await processTable()
+  for (const c of targets) {
+    const claude = c.pid ? claudeOf(table, c.pid) : undefined
+    const pid = claude?.pid ?? c.pid
+    if (!pid) continue
+    mkdirSync(dirname(stopFlag(c.route)), { recursive: true })
+    writeFileSync(stopFlag(c.route), new Date().toISOString())
+    log(`closing session ${c.route}: ${claude ? `claude pid ${pid}` : `channel server pid ${pid} (no claude process found)`}`)
+    await killTree(pid)
+    // Tabs opened by an older launcher have no stop-flag check and would sit
+    // at a PowerShell prompt: close that shell — only if it runs our launcher.
+    const shell = claude && table.get(claude.ppid)
+    const launcher = launcherPath(c.route)
+    if (shell && launcher && /^(powershell|pwsh)(\.exe)?$/i.test(shell.name) && shell.cmd.toLowerCase().includes(launcher.toLowerCase())) {
+      setTimeout(() => {
+        if (!existsSync(stopFlag(c.route))) return
+        rmSync(stopFlag(c.route), { force: true })
+        void killTree(shell.pid)
+      }, 4000)
+    }
+  }
+  const gone = (c: Client) => clients.get(c.route)?.ws !== c.ws
+  for (const end = Date.now() + 10_000; Date.now() < end && !targets.every(gone); ) await Bun.sleep(200)
+  return targets.filter(gone).map(c => c.route)
+}
+
+function setMaxSessions(n: number): void {
+  const old = cfg.maxSessions
+  cfg.maxSessions = n
+  updateConfigFile({ maxSessions: n })
+  log(`session limit ${old} → ${n}`)
 }
 
 // Sessions that never connected: tell the topic once, keep the queue for a
@@ -573,10 +677,25 @@ const server = (() => {
           setTimeout(() => process.exit(0), 200)
           return new Response('bye')
         }
+        if (url.pathname === '/control' && req.method === 'POST') {
+          if (req.headers.get('x-tg-router-secret') !== SECRET) return new Response('forbidden', { status: 403 })
+          return (async () => {
+            const body = (await req.json().catch(() => ({}))) as { stop?: string[]; maxSessions?: number }
+            if (Array.isArray(body.stop)) return Response.json({ closed: await stopSessions(body.stop.map(String)) })
+            const n = body.maxSessions
+            if (typeof n === 'number' && Number.isInteger(n) && n >= 1 && n <= MAX_SESSIONS_CAP) {
+              const old = cfg.maxSessions
+              setMaxSessions(n)
+              return Response.json({ maxSessions: n, old })
+            }
+            return Response.json({ error: 'expected {stop: [routes]} or {maxSessions: 1..' + MAX_SESSIONS_CAP + '}' }, { status: 400 })
+          })()
+        }
         if (url.pathname === '/status') {
           return Response.json({
             version: PLUGIN_VERSION,
             bot: botUsername,
+            maxSessions: cfg.maxSessions,
             sessions: [...clients.values()].map(c => ({ route: c.route, ...infoFor(c.route), dir: c.dir, pid: c.pid, since: new Date(c.since).toISOString() })),
             starting: [...pending.keys()],
             queued: Object.fromEntries([...queues].map(([k, q]) => [k, q.length])),

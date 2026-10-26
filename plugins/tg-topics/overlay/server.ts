@@ -802,7 +802,7 @@ setInterval(() => {
   if (process.stdin.destroyed || process.stdin.readableEnded) shutdown()
 }, 5000).unref()
 
-// Bot commands (/start /help /setup /id /status /sessions /limits) — texts and access
+// Bot commands (/start /help /setup /id /status /sessions /stop /maxsessions /limits) — texts and access
 // rules live in bot-ui.ts, shared with tg-router, which answers them itself
 // while it runs. This handler covers polling mode. Strangers get nothing in
 // allowlist mode or in groups that weren't added (no pairing codes leak and
