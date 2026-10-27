@@ -43,6 +43,10 @@ export type Config = {
   spawnTimeoutSec: number
   queueTtlSec: number
   announceSpawn: boolean
+  /** After a reboot / power loss, reopen the sessions that were running (claude --resume). */
+  resumeOnStart: boolean
+  /** How long the router waits after its start for still-running sessions to reconnect before resuming the rest. */
+  resumeGraceSec: number
   dm: { spawn: boolean; dir: string }
   plugin: { autoPatch: boolean; installedPluginsFile: string; pluginKey: string }
 }
@@ -72,6 +76,8 @@ export function defaultConfig(): Config {
     spawnTimeoutSec: 180,
     queueTtlSec: 900,
     announceSpawn: true,
+    resumeOnStart: true,
+    resumeGraceSec: 45,
     dm: { spawn: true, dir: homedir() },
     plugin: { autoPatch: true, installedPluginsFile: INSTALLED_PLUGINS, pluginKey: OFFICIAL_KEY },
   }
@@ -101,6 +107,11 @@ export function updateConfigFile(patch: Partial<Config>): void {
   mkdirSync(resolve(CONFIG_FILE, '..'), { recursive: true })
   writeFileSync(CONFIG_FILE + '.tmp', JSON.stringify({ ...user, ...patch }, null, 2) + '\n')
   renameSync(CONFIG_FILE + '.tmp', CONFIG_FILE)
+}
+
+/** A per-route file in a state subfolder (stop flags, session ids, busy marks). */
+export function routeFile(sub: string, route: string, ext = ''): string {
+  return join(STATE, sub, route.replace(/[^\w-]/g, '_') + ext)
 }
 
 export function routerHttp(cfg: Config): string {

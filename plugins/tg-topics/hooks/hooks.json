@@ -1,5 +1,5 @@
 {
-  "description": "tg-topics: keeps the Telegram overlay and tg-router running; reminds topic sessions to update MEMORY.md",
+  "description": "tg-topics: keeps the Telegram overlay and tg-router running; remembers Telegram sessions so they come back after a reboot; reminds topic sessions to update MEMORY.md",
   "hooks": {
     "SessionStart": [
       {
@@ -11,6 +11,27 @@
             "timeout": 30
           }
         ]
+      },
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun \"${CLAUDE_PLUGIN_ROOT}/hooks/session-state.ts\" start",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun \"${CLAUDE_PLUGIN_ROOT}/hooks/session-state.ts\" busy",
+            "timeout": 10
+          }
+        ]
       }
     ],
     "Stop": [
@@ -20,6 +41,11 @@
             "type": "command",
             "command": "bun \"${CLAUDE_PLUGIN_ROOT}/hooks/memory-reminder.ts\"",
             "timeout": 15
+          },
+          {
+            "type": "command",
+            "command": "bun \"${CLAUDE_PLUGIN_ROOT}/hooks/session-state.ts\" idle",
+            "timeout": 10
           }
         ]
       }

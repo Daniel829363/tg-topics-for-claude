@@ -1209,6 +1209,27 @@ function connectRouter(attempt: number): void {
       case 'topic':
         if (m.key && m.info) topicInfo.set(m.key, m.info)
         break
+      case 'resume': {
+        // Reopened after a reboot in the middle of a task: the router asks
+        // Claude to carry on. Not a Telegram message, so no gate and no history.
+        if (m.info) topicInfo.set(ROUTE, m.info)
+        const topicName = m.info?.topic
+        void mcpReady.then(() => mcp.notification({
+          method: 'notifications/claude/channel',
+          params: {
+            content: String(m.text ?? ''),
+            meta: {
+              chat_id: String(m.chat_id),
+              user: 'tg-topics',
+              source: 'tg-topics-router',
+              ts: new Date().toISOString(),
+              ...(m.thread != null ? { thread_id: String(m.thread) } : {}),
+              ...(topicName ? { topic: safeName(topicName)! } : {}),
+            },
+          },
+        })).catch(err => process.stderr.write(`telegram channel: failed to deliver resume notice: ${err}\n`))
+        break
+      }
       case 'superseded':
         // A newer session registered the same route — it gets the messages now.
         superseded = true

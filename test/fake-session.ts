@@ -2,6 +2,8 @@
  * Stands in for an interactive `claude` session in tests: runs the patched
  * plugin as an MCP server over stdio, records every channel notification and
  * answers each one with reply (without thread_id — the plugin must route it).
+ * Runs the session-state hooks the way Claude Code would: start on launch,
+ * idle after each answered message (except "долгая задача" — still working).
  */
 
 import { appendFileSync } from 'fs'
@@ -13,7 +15,12 @@ const route = process.env.TELEGRAM_ROUTE ?? 'dm'
 const record = (kind: string, data: unknown) =>
   appendFileSync(join(OUT, 'sessions.jsonl'), JSON.stringify({ kind, route, pid: process.pid, data }) + '\n')
 
-record('spawned', { cwd: process.cwd() })
+record('spawned', { cwd: process.cwd(), resume: process.env.TELEGRAM_RESUME })
+
+function hook(mode: string, input: unknown = {}): void {
+  Bun.spawnSync(['bun', join(process.env.TG_TEST_TOPICS!, 'hooks', 'session-state.ts'), mode], { env: process.env, stdin: Buffer.from(JSON.stringify(input)) })
+}
+hook('start', { session_id: `fake-${route}`, source: process.env.TELEGRAM_RESUME ? 'resume' : 'startup', cwd: process.cwd() })
 
 const child = Bun.spawn(['bun', join(PLUGIN, 'server.ts')], {
   cwd: PLUGIN,
@@ -55,6 +62,7 @@ function notify(method: string, params: unknown = {}): void {
         record('inbound', msg.params)
         const meta = msg.params.meta
         rpc('tools/call', { name: 'reply', arguments: { chat_id: meta.chat_id, text: `echo[${route}]: ${msg.params.content}` } })
+        if (!String(msg.params.content).includes('долгая задача')) hook('idle')
       }
       if (msg.result?.content) record('tool_result', msg.result.content[0]?.text)
     }

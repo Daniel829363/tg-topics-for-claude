@@ -43,6 +43,7 @@ writeFileSync(join(TMP, 'config.json'), JSON.stringify({
   command: ['bun', join(T, 'fake-session.ts')],
   dm: { spawn: true, dir: join(TMP, 'dm') },
   plugin: { autoPatch: false },
+  resumeGraceSec: 30,
 }))
 mkdirSync(join(TMP, 'dm'), { recursive: true })
 // A Claude Code login for /limits, which then asks the mock instead of Anthropic.
@@ -63,6 +64,7 @@ const env = {
   TG_ROUTER_LOG: join(TMP, 'router.log'),
   TG_TEST_PLUGIN: PLUGIN_COPY,
   TG_TEST_OUT: TMP,
+  TG_TEST_TOPICS: PLUGIN,
 }
 delete (env as any).TELEGRAM_ROUTE
 delete (env as any).TELEGRAM_TOPIC_DIR
@@ -285,6 +287,33 @@ try {
   await push(groupMsg(-1001, 20, 'тема снова'))
   const again = await waitFor(async () => (await sent()).find(m => String(m.text).endsWith('тема снова')), 60_000, 'closed topic restarts')
   check(again?.text.startsWith('echo[-1001:20]'), 'a closed topic starts a new session on its next message')
+  const reopened = sessions().filter(s => s.kind === 'spawned' && s.route === '-1001:20').at(-1)
+  check(reopened && !reopened.data.resume, 'a topic closed with /stop starts fresh, not resumed')
+
+  // ---- F: power loss — router and all sessions die at once; the router reopens them
+  const busyFile = (route: string) => join(TMP, 'router-state', 'busy', route.replace(/[^\w-]/g, '_'))
+  await push(groupMsg(-1001, 20, 'долгая задача'))
+  await waitFor(async () => (await sent()).find(m => String(m.text).endsWith('долгая задача')), 15_000, 'long task delivered')
+  const before = await status()
+  const liveBefore: string[] = [...(before?.live ?? [])].sort()
+  check(liveBefore.join() === ['-1001:20', '-1002:5', 'dm'].join(), `live.json lists the running sessions (${liveBefore.join(', ')})`)
+  check(existsSync(busyFile('-1001:20')) && !existsSync(busyFile('-1002:5')), 'the route mid-task is marked busy, finished ones are not')
+  check(JSON.parse(readFileSync(join(TMP, 'router-state', 'sessions', '-1001_20.json'), 'utf8')).session_id === 'fake--1001:20', 'SessionStart hook saved the session id')
+  router.kill()
+  await router.exited
+  for (const s of sessions().filter(s => s.kind === 'spawned')) { try { process.kill(s.pid) } catch {} }
+  await Bun.sleep(3000)
+  const spawnedBefore = sessions().filter(s => s.kind === 'spawned').length
+  router = startRouter()
+  const back2 = await waitFor(async () => { const s = await status(); return s?.sessions?.length === liveBefore.length ? s : undefined }, 70_000, 'sessions resumed')
+  const resumed = sessions().filter(s => s.kind === 'spawned').slice(spawnedBefore)
+  check(back2 && resumed.map(s => s.route).sort().join() === liveBefore.join(), `after the "power loss" every live session was reopened (${resumed.map(s => s.route).join(', ')})`)
+  check(resumed.every(s => s.data.resume === `fake-${s.route}`), 'each one resumed its own conversation (--resume <saved id>)')
+  const cont = await waitFor(async () => (await sent()).find(m => String(m.text).startsWith('echo[-1001:20]: ⚡')), 15_000, 'resume prompt answered')
+  check(cont?.message_thread_id == 20, 'the session that was mid-task got the "continue" prompt and answered in its topic')
+  await Bun.sleep(1500)
+  check(!sessions().some(s => s.kind === 'inbound' && s.route !== '-1001:20' && String(s.data.content).startsWith('⚡')), 'idle sessions were reopened without a prompt')
+  check(await replyTo(111, /♻️.*восстанавливаю сессии \(3\).*Продолжат прерванную работу: Тест группа \/ Сценарии/s), 'the owner gets one DM listing the restored sessions')
 } finally {
   router.kill()
   for (const s of sessions().filter(s => s.kind === 'spawned')) { try { process.kill(s.pid) } catch {} }
