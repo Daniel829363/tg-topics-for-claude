@@ -31,7 +31,7 @@ import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, appendFileSync } from 'fs'
 import { homedir } from 'os'
-import { execFileSync } from 'child_process'
+import { execFileSync, spawn } from 'child_process'
 import { join, extname, sep } from 'path'
 import { parseCommand, handleCommand, ensureBotCommands, apiCaller } from './bot-ui.ts'
 
@@ -233,6 +233,82 @@ function defaultAccess(): Access {
 
 const MAX_CHUNK_LIMIT = 4096
 const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
+const BOTAPI_DOWNLOAD_BYTES = 20 * 1024 * 1024
+
+// ---- Big files over MTProto (TG-TOPICS) ----
+// With TELEGRAM_API_ID + TELEGRAM_API_HASH (my.telegram.org) in .env, files the Bot API refuses
+// (download > 20 MB, upload > 50 MB) go through MTProto as the same bot, up to 2 GB.
+// The helper (mtproto.ts, gramJS) runs as a child process from <STATE_DIR>/mtproto with its own
+// node_modules, installed on first use — nothing extra is loaded unless a big file shows up.
+const MTPROTO_MAX_BYTES = 2000 * 1024 * 1024
+const MTPROTO_DIR = join(STATE_DIR, 'mtproto')
+const MTPROTO_PKG = '{\n  "name": "tg-topics-mtproto",\n  "private": true,\n  "type": "module",\n  "dependencies": { "telegram": "2.26.22", "big-integer": "^1.6.52" }\n}\n'
+const hasMtproto = () => !!(process.env.TELEGRAM_API_ID?.trim() && process.env.TELEGRAM_API_HASH?.trim())
+const MTPROTO_HINT = 'Set TELEGRAM_API_ID and TELEGRAM_API_HASH (from my.telegram.org) in ~/.claude/channels/telegram/.env and restart the session to allow files up to 2 GB.'
+const attachInfo = new Map<string, AttachmentMeta>()
+function rememberAttachment(a: AttachmentMeta): void {
+  attachInfo.set(a.file_id, a)
+  if (attachInfo.size > 500) attachInfo.delete(attachInfo.keys().next().value!)
+}
+const MIME_EXT: Record<string, string> = {
+  'video/mp4': 'mp4', 'video/quicktime': 'mov', 'video/x-matroska': 'mkv', 'video/webm': 'webm',
+  'audio/ogg': 'oga', 'audio/mpeg': 'mp3', 'audio/mp4': 'm4a', 'audio/x-wav': 'wav', 'audio/wav': 'wav',
+  'application/pdf': 'pdf', 'application/zip': 'zip', 'image/jpeg': 'jpg', 'image/png': 'png',
+}
+const KIND_EXT: Record<string, string> = { voice: 'oga', audio: 'mp3', video: 'mp4', video_note: 'mp4', animation: 'mp4', sticker: 'webp' }
+function extOf(a: AttachmentMeta | undefined): string {
+  const fromName = a?.name && a.name.includes('.') ? a.name.split('.').pop()! : ''
+  const e = fromName || (a?.mime ? MIME_EXT[a.mime.toLowerCase()] : '') || (a ? KIND_EXT[a.kind] : '') || 'bin'
+  return e.replace(/[^a-zA-Z0-9]/g, '').slice(0, 10) || 'bin'
+}
+function runChild(cmd: string, args: string[], opts: { cwd: string; input?: string; timeoutMs: number; env?: NodeJS.ProcessEnv }): Promise<{ code: number; stdout: string; stderr: string }> {
+  return new Promise((resolveP, reject) => {
+    const p = spawn(cmd, args, { cwd: opts.cwd, env: opts.env ?? process.env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true })
+    let stdout = '', stderr = ''
+    p.stdout.on('data', d => { stdout += d })
+    p.stderr.on('data', d => { if (stderr.length < 20000) stderr += d })
+    const t = setTimeout(() => { p.kill(); reject(new Error(`${args[0] ?? cmd} timed out`)) }, opts.timeoutMs)
+    p.on('error', e => { clearTimeout(t); reject(e) })
+    p.on('close', code => { clearTimeout(t); resolveP({ code: code ?? -1, stdout, stderr }) })
+    p.stdin.end(opts.input ?? '')
+  })
+}
+let mtprotoReady: Promise<string> | undefined
+function ensureMtproto(): Promise<string> {
+  mtprotoReady ??= (async () => {
+    mkdirSync(MTPROTO_DIR, { recursive: true, mode: 0o700 })
+    const helper = join(MTPROTO_DIR, 'mtproto.ts')
+    const src = readFileSync(join(import.meta.dir, 'mtproto.ts'), 'utf8')
+    let cur = ''
+    try { cur = readFileSync(helper, 'utf8') } catch {}
+    if (cur !== src) writeFileSync(helper, src)
+    let pkg = ''
+    try { pkg = readFileSync(join(MTPROTO_DIR, 'package.json'), 'utf8') } catch {}
+    let installed = false
+    try { statSync(join(MTPROTO_DIR, 'node_modules', 'telegram', 'package.json')); installed = true } catch {}
+    if (pkg !== MTPROTO_PKG || !installed) {
+      writeFileSync(join(MTPROTO_DIR, 'package.json'), MTPROTO_PKG)
+      const r = await runChild(process.execPath, ['install', '--no-summary'], { cwd: MTPROTO_DIR, timeoutMs: 5 * 60_000 })
+      if (r.code !== 0) throw new Error(`could not install the MTProto helper (bun install): ${r.stderr.slice(-500)}`)
+    }
+    return helper
+  })().catch(e => { mtprotoReady = undefined; throw e })
+  return mtprotoReady
+}
+async function mtproto(req: Record<string, unknown>): Promise<any> {
+  const helper = await ensureMtproto()
+  const r = await runChild(process.execPath, [helper], {
+    cwd: MTPROTO_DIR,
+    input: JSON.stringify(req),
+    timeoutMs: 60 * 60_000,
+    env: { ...process.env, TELEGRAM_BOT_TOKEN: TOKEN },
+  })
+  const line = r.stdout.trim().split('\n').pop() ?? ''
+  let res: any
+  try { res = JSON.parse(line) } catch { throw new Error(`MTProto helper failed (exit ${r.code}): ${r.stderr.slice(-500) || line.slice(-500)}`) }
+  if (!res.ok) throw new Error(`MTProto: ${res.error}`)
+  return res
+}
 
 // reply's files param takes any path. .env is ~60 bytes and ships as a
 // document. Claude can already Read+paste file contents, so this isn't a new
@@ -578,7 +654,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           files: {
             type: 'array',
             items: { type: 'string' },
-            description: 'Absolute file paths to attach. Images send as photos (inline preview); other types as documents. Max 50MB each.',
+            description: 'Absolute file paths to attach. Images send as photos (inline preview); other types as documents. Max 50MB each, or up to 2GB when TELEGRAM_API_ID/TELEGRAM_API_HASH are configured (big files go as documents via MTProto).',
           },
           format: {
             type: 'string',
@@ -604,7 +680,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'download_attachment',
-      description: 'Download a file attachment from a Telegram message to the local inbox. Use when the inbound <channel> meta shows attachment_file_id. Returns the local file path ready to Read. Telegram caps bot downloads at 20MB.',
+      description: 'Download a file attachment from a Telegram message to the local inbox. Use when the inbound <channel> meta shows attachment_file_id. Returns the local file path ready to Read. Bot API caps downloads at 20MB; with TELEGRAM_API_ID/TELEGRAM_API_HASH configured, bigger files (up to 2GB) are fetched via MTProto — may take a while.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -653,8 +729,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         for (const f of files) {
           assertSendable(f)
           const st = statSync(f)
-          if (st.size > MAX_ATTACHMENT_BYTES) {
-            throw new Error(`file too large: ${f} (${(st.size / 1024 / 1024).toFixed(1)}MB, max 50MB)`)
+          if (st.size > MAX_ATTACHMENT_BYTES && !hasMtproto()) {
+            throw new Error(`file too large: ${f} (${(st.size / 1024 / 1024).toFixed(1)}MB, Bot API max 50MB). ${MTPROTO_HINT}`)
+          }
+          if (st.size > MTPROTO_MAX_BYTES) {
+            throw new Error(`file too large: ${f} (${(st.size / 1024 / 1024).toFixed(1)}MB, max 2000MB)`)
           }
         }
 
@@ -689,6 +768,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         // sendMessage call). Thread under reply_to if present.
         for (const f of files) {
           const ext = extname(f).toLowerCase()
+          if (statSync(f).size > MAX_ATTACHMENT_BYTES) {
+            // Bot API refuses > 50 MB — MTProto as the same bot (checked above that it's configured)
+            const r = await mtproto({
+              op: 'send', chatId: chat_id, files: [f],
+              ...(thread != null ? { threadId: thread } : {}),
+              ...(reply_to != null && replyMode !== 'off' ? { replyTo: reply_to } : {}),
+            })
+            sentIds.push(...(r.ids as number[]))
+            continue
+          }
           const input = new InputFile(f)
           const opts = {
             ...threadOpt,
@@ -722,7 +811,26 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
       case 'download_attachment': {
         const file_id = args.file_id as string
-        const file = await bot.api.getFile(file_id)
+        const known = attachInfo.get(file_id)
+        const viaMtproto = async () => {
+          const uniq = file_id.slice(-16).replace(/[^a-zA-Z0-9_-]/g, '') || 'dl'
+          const path = join(INBOX_DIR, `${Date.now()}-${uniq}.${extOf(known)}`)
+          mkdirSync(INBOX_DIR, { recursive: true })
+          await mtproto({ op: 'download', fileId: file_id, out: path })
+          return { content: [{ type: 'text', text: path }] }
+        }
+        // Bot API can't serve > 20 MB: go straight to MTProto when we know the size
+        if (known?.size != null && known.size > BOTAPI_DOWNLOAD_BYTES && hasMtproto()) return await viaMtproto()
+        let file
+        try {
+          file = await bot.api.getFile(file_id)
+        } catch (err) {
+          if (/file is too big/i.test(String(err))) {
+            if (hasMtproto()) return await viaMtproto()
+            throw new Error(`file is bigger than 20MB — the Bot API cannot download it. ${MTPROTO_HINT}`)
+          }
+          throw err
+        }
         if (!file.file_path) throw new Error('Telegram returned no file_path — file may have expired')
         const url = `${API_ROOT}/file/bot${TOKEN}/${file.file_path}`
         const res = await fetch(url)
@@ -1101,13 +1209,13 @@ async function handleInbound(
         ...(thread != null ? { thread_id: String(thread) } : {}),
         ...(topicName ? { topic: safeName(topicName)! } : {}),
         ...(imagePath ? { image_path: imagePath } : {}),
-        ...(attachment ? {
+        ...(attachment ? (rememberAttachment(attachment), {
           attachment_kind: attachment.kind,
           attachment_file_id: attachment.file_id,
           ...(attachment.size != null ? { attachment_size: String(attachment.size) } : {}),
           ...(attachment.mime ? { attachment_mime: attachment.mime } : {}),
           ...(attachment.name ? { attachment_name: attachment.name } : {}),
-        } : {}),
+        }) : {}),
       },
     },
   }).catch(err => {

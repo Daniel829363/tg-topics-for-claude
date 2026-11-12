@@ -140,8 +140,8 @@ export function readToken(cfg: Config): string {
 // confirmation, so tg-topics doesn't ship a channel of its own: it overlays
 // the official telegram plugin's server with a router-aware version.
 export const OVERLAY_DIR = join(PLUGIN_ROOT, 'overlay')
-// bot-ui.ts first: server.ts imports it.
-export const OVERLAY_FILES = ['bot-ui.ts', 'server.ts']
+// server.ts last: it imports bot-ui.ts and reads mtproto.ts.
+export const OVERLAY_FILES = ['bot-ui.ts', 'mtproto.ts', 'server.ts']
 const OVERLAY_MARK = /TG-TOPICS-OVERLAY|TG-ROUTER-PATCH/
 
 export type Install = { installPath: string; version?: string; scope?: string; lastUpdated?: string }
@@ -211,6 +211,7 @@ export function removeOverlay(cfg: Config): string[] {
     if (!existsSync(upstream)) continue
     copyFileSync(upstream, join(i.installPath, 'server.ts'))
     rmSync(join(i.installPath, 'bot-ui.ts'), { force: true })
+    rmSync(join(i.installPath, 'mtproto.ts'), { force: true })
     restored.push(i.installPath)
   }
   return restored
