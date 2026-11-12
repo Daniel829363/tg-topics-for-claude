@@ -32,7 +32,7 @@ import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, appendFileSync } from 'fs'
 import { homedir } from 'os'
 import { execFileSync, spawn } from 'child_process'
-import { join, extname, sep } from 'path'
+import { join, extname, sep, basename } from 'path'
 import { parseCommand, handleCommand, ensureBotCommands, apiCaller } from './bot-ui.ts'
 
 const STATE_DIR = process.env.TELEGRAM_STATE_DIR
@@ -580,7 +580,7 @@ const mcp = new Server(
           ? ` This session is dedicated to one topic (route ${ROUTE}); replies to chat ${ROUTE_CHAT} default to that topic automatically.`
           : ''),
       '',
-      'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
+      'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. For a task that takes minutes (render, build, upload), start a self-updating bar with progress (action "start" + eta that includes the upload of the result); deliver the result with reply + progress_id so the bar turns ✅ only after the files have arrived (or call progress "done" when there is nothing to send). Write its title/stage/text in the user\'s language. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
       '',
       "Telegram's Bot API exposes no history or search — you only see messages as they arrive. If you need earlier context, ask the user to paste it or summarize.",
       '',
@@ -632,6 +632,64 @@ mcp.setNotificationHandler(
   },
 )
 
+// ---------------------------------------------------------------------------
+// progress: a self-updating progress-bar message. Claude starts it with an ETA,
+// the server edits it on a timer (bar, %, time left, stage) until done/fail.
+// Lives in this process — if the session ends, the bar simply stops updating.
+type Progress = {
+  chat_id: string
+  message_id: number
+  title: string
+  t0: number
+  end: number
+  stage?: string
+  status: 'run' | 'done' | 'fail'
+  final?: string
+  last: string
+  timer?: ReturnType<typeof setInterval>
+}
+// Telegram edit limits — keep a wide margin (env override is for tests)
+const PROGRESS_TICK_MS = Number(process.env.TELEGRAM_PROGRESS_TICK_MS) || 15_000
+const PROGRESS_HOLD = 0.95 // bar never reaches 100% until done
+const progresses = new Map<number, Progress>()
+
+function parseEta(v: unknown): number {
+  if (typeof v === 'number' && v > 0) return v * 1000
+  const m = /^\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s?)?\s*$/i.exec(String(v ?? ''))
+  if (!m || (!m[1] && !m[2])) throw new Error(`bad eta "${v}" — use seconds or "6m", "90s", "2m30"`)
+  return (Number(m[1] ?? 0) * 60 + Number(m[2] ?? 0)) * 1000
+}
+
+function progressBar(p: number, n = 16): string {
+  const full = Math.round(p * n)
+  return '▓'.repeat(full) + '░'.repeat(n - full)
+}
+
+function renderProgress(p: Progress, now = Date.now()): string {
+  // Language-neutral on purpose: the words come from Claude (title/stage/text) in the user's language.
+  if (p.status === 'done') return `✅ ${p.title}\n${progressBar(1)} 100%${p.final ? `\n${p.final}` : ''}`
+  if (p.status === 'fail') return `❌ ${p.title}${p.final ? `\n${p.final}` : ''}`
+  const frac = Math.min(PROGRESS_HOLD, Math.max(0, (now - p.t0) / Math.max(1, p.end - p.t0)))
+  const left = Math.round((p.end - now) / 1000)
+  const mmss = (s: number) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
+  const tail = left >= 0 ? `⏱ ${mmss(left)}` : `⏱ +${mmss(-left)}` // overdue counts up
+  return `⏳ ${p.title}\n${progressBar(frac)} ${Math.floor(frac * 100)}% · ${tail}${p.stage ? `\n▸ ${p.stage}` : ''}`
+}
+
+async function pushProgress(p: Progress): Promise<void> {
+  const text = renderProgress(p)
+  if (text === p.last) return
+  p.last = text
+  await bot.api.editMessageText(p.chat_id, p.message_id, text).catch(e => {
+    if (!/not modified/i.test(String(e))) process.stderr.write(`progress edit ${p.message_id} failed: ${e}\n`)
+  })
+}
+
+function stopProgress(p: Progress): void {
+  if (p.timer) clearInterval(p.timer)
+  p.timer = undefined
+}
+
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
@@ -660,6 +718,10 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             type: 'string',
             enum: ['text', 'markdownv2'],
             description: "Rendering mode. 'markdownv2' enables Telegram formatting (bold, italic, code, links). Caller must escape special chars per MarkdownV2 rules. Default: 'text' (plain, no escaping needed).",
+          },
+          progress_id: {
+            type: 'string',
+            description: 'Optional: a running progress bar (from progress start). While the files upload the bar shows the upload; it turns ✅ only after Telegram has them — so pass it on the reply that delivers the result instead of calling progress done first.',
           },
         },
         required: ['chat_id', 'text'],
@@ -705,6 +767,25 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           },
         },
         required: ['chat_id', 'message_id', 'text'],
+      },
+    },
+    {
+      name: 'progress',
+      description:
+        'Self-updating progress bar for long tasks (renders, builds, uploads). action "start" sends a message with your ETA; the server then edits it every 15 s on its own (bar, %, time left, current stage) — no further calls needed. Optional "stage" changes the stage line and/or re-estimates the ETA. Finish with "done" (bar → 100% ✅) or "fail" — or, when the result is a file, pass progress_id to reply instead: the bar shows the upload and turns ✅ only once Telegram has the file. Include upload time in the eta. The bar holds at 95% if the ETA passes. Edits don\'t ping — the result still goes as a new reply.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['start', 'stage', 'done', 'fail'] },
+          chat_id: { type: 'string', description: 'start only' },
+          thread_id: { type: 'string', description: 'start only: forum topic, as for reply' },
+          title: { type: 'string', description: 'start only: what is running, e.g. "Rendering v3"' },
+          eta: { type: 'string', description: 'start (required) / stage (optional): expected time left — seconds or "6m", "90s", "2m30"' },
+          stage: { type: 'string', description: 'start / stage: current step, e.g. "Mixing audio"' },
+          text: { type: 'string', description: 'done / fail: final line' },
+          progress_id: { type: 'string', description: 'stage / done / fail: the id returned by start (the message id)' },
+        },
+        required: ['action'],
       },
     },
   ],
@@ -764,9 +845,26 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           )
         }
 
+        // A progress bar tied to this reply stays open while the files upload and
+        // closes only once Telegram has them (big videos can take a while).
+        const bar = args.progress_id != null ? progresses.get(Number(args.progress_id)) : undefined
+        const finishBar = async (status: 'done' | 'fail', final?: string) => {
+          if (!bar) return
+          bar.status = status
+          bar.final = final
+          stopProgress(bar)
+          progresses.delete(bar.message_id)
+          await pushProgress(bar)
+        }
+
         // Files go as separate messages (Telegram doesn't mix text+file in one
         // sendMessage call). Thread under reply_to if present.
+        try {
         for (const f of files) {
+          if (bar) {
+            bar.stage = `📤 ${basename(f)} (${(statSync(f).size / 1024 / 1024).toFixed(1)} MB)`
+            await pushProgress(bar)
+          }
           const ext = extname(f).toLowerCase()
           if (statSync(f).size > MAX_ATTACHMENT_BYTES) {
             // Bot API refuses > 50 MB — MTProto as the same bot (checked above that it's configured)
@@ -791,6 +889,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
             sentIds.push(sent.message_id)
           }
         }
+        } catch (err) {
+          await finishBar('fail', `📤 ${err instanceof Error ? err.message : String(err)}`)
+          throw err
+        }
+        await finishBar('done', bar?.final)
 
         if (chat_id === ROUTE_CHAT && thread === ROUTE_THREAD) {
           logHistory({ dir: 'out', message_ids: sentIds, text, ...(files.length ? { files } : {}) })
@@ -858,6 +961,51 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         )
         const id = typeof edited === 'object' ? edited.message_id : args.message_id
         return { content: [{ type: 'text', text: `edited (id: ${id})` }] }
+      }
+      case 'progress': {
+        const action = args.action as string
+        if (action === 'start') {
+          const chat_id = args.chat_id as string
+          if (!chat_id) throw new Error('start needs chat_id')
+          assertAllowedChat(chat_id)
+          const thread = resolveThread(chat_id, args.thread_id)
+          const now = Date.now()
+          const p: Progress = {
+            chat_id, message_id: 0, title: (args.title as string) || 'Working',
+            t0: now, end: now + parseEta(args.eta), stage: args.stage as string | undefined,
+            status: 'run', last: '',
+          }
+          p.last = renderProgress(p, now)
+          const sent = await bot.api.sendMessage(chat_id, p.last, thread != null ? { message_thread_id: thread } : {})
+          p.message_id = sent.message_id
+          progresses.set(p.message_id, p)
+          // safety net: stop editing at 3× the ETA + 10 min even if done never comes
+          const hardStop = p.end + 2 * (p.end - now) + 600_000
+          p.timer = setInterval(() => {
+            if (Date.now() > hardStop) {
+              p.status = 'fail'
+              stopProgress(p)
+              progresses.delete(p.message_id)
+            }
+            void pushProgress(p)
+          }, PROGRESS_TICK_MS)
+          return { content: [{ type: 'text', text: `progress started (progress_id: ${p.message_id})` }] }
+        }
+        const p = progresses.get(Number(args.progress_id))
+        if (!p) throw new Error(`no progress bar with progress_id ${args.progress_id} in this session`)
+        if (action === 'stage') {
+          if (args.stage != null) p.stage = args.stage as string
+          if (args.eta != null) p.end = Date.now() + parseEta(args.eta)
+        } else if (action === 'done' || action === 'fail') {
+          p.status = action
+          p.final = args.text as string | undefined
+          stopProgress(p)
+          progresses.delete(p.message_id)
+        } else {
+          throw new Error(`unknown action "${action}" — start, stage, done or fail`)
+        }
+        await pushProgress(p)
+        return { content: [{ type: 'text', text: `progress ${action} (progress_id: ${p.message_id})` }] }
       }
       default:
         return {

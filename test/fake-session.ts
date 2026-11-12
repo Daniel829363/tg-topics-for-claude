@@ -6,7 +6,7 @@
  * idle after each answered message (except "долгая задача" — still working).
  */
 
-import { appendFileSync } from 'fs'
+import { appendFileSync, writeFileSync } from 'fs'
 import { join } from 'path'
 
 const PLUGIN = process.env.TG_TEST_PLUGIN!
@@ -31,6 +31,7 @@ const child = Bun.spawn(['bun', join(PLUGIN, 'server.ts')], {
 })
 
 let id = 1
+let finishWith: 'done' | 'file' = 'done'
 function rpc(method: string, params: unknown): void {
   child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id: id++, method, params }) + '\n')
 }
@@ -62,9 +63,27 @@ function notify(method: string, params: unknown = {}): void {
         record('inbound', msg.params)
         const meta = msg.params.meta
         rpc('tools/call', { name: 'reply', arguments: { chat_id: meta.chat_id, text: `echo[${route}]: ${msg.params.content}` } })
+        if (String(msg.params.content).includes('прогресс')) {
+          finishWith = String(msg.params.content).includes('файл') ? 'file' : 'done'
+          rpc('tools/call', { name: 'progress', arguments: { action: 'start', chat_id: meta.chat_id, title: finishWith === 'file' ? 'Отправка' : 'Рендер', eta: '3s', stage: 'этап 1' } })
+        }
         if (!String(msg.params.content).includes('долгая задача')) hook('idle')
       }
       if (msg.result?.content) record('tool_result', msg.result.content[0]?.text)
+      // progress bar started → let it tick a few times, then change the stage and finish
+      const started = /progress started \(progress_id: (\d+)\)/.exec(msg.result?.content?.[0]?.text ?? '')
+      if (started) {
+        const progress_id = started[1]
+        setTimeout(() => rpc('tools/call', { name: 'progress', arguments: { action: 'stage', progress_id, stage: 'этап 2' } }), 800)
+        if (finishWith === 'file') {
+          // result delivered with the bar attached: it must close only after the upload
+          const f = join(OUT, 'result.mp4')
+          writeFileSync(f, 'fake video')
+          setTimeout(() => rpc('tools/call', { name: 'reply', arguments: { chat_id: '-1001', text: 'вот видео', files: [f], progress_id } }), 1600)
+        } else {
+          setTimeout(() => rpc('tools/call', { name: 'progress', arguments: { action: 'done', progress_id, text: 'готово' } }), 1600)
+        }
+      }
     }
   }
 })()

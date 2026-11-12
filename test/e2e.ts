@@ -65,6 +65,7 @@ const env = {
   TG_TEST_PLUGIN: PLUGIN_COPY,
   TG_TEST_OUT: TMP,
   TG_TEST_TOPICS: PLUGIN,
+  TELEGRAM_PROGRESS_TICK_MS: '300',
 }
 delete (env as any).TELEGRAM_ROUTE
 delete (env as any).TELEGRAM_TOPIC_DIR
@@ -175,6 +176,32 @@ try {
   check(readFileSync(join(ws, 'CLAUDE.md'), 'utf8').includes('«Видео монтаж»') && readFileSync(join(ws, 'CLAUDE.md'), 'utf8').includes('@MEMORY.md'), 'CLAUDE.md rendered with topic name and memory import')
   const hist = existsSync(join(ws, 'history.jsonl')) ? readFileSync(join(ws, 'history.jsonl'), 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l)) : []
   check(hist.some(h => h.dir === 'in' && h.text === 'задача A') && hist.some(h => h.dir === 'out'), 'history.jsonl records inbound and outbound')
+
+  // ---- P: progress tool — the server keeps editing the bar on its own until done
+  await push(groupMsg(-1001, 10, 'прогресс рендера'))
+  const bar = await replyTo(-1001, /^⏳ Рендер/, 15_000)
+  check(bar?.message_thread_id == 10 && /░/.test(bar.text) && bar.text.includes('▸ этап 1') && bar.text.includes('⏱'), 'progress start: bar message in the topic with stage and time left')
+  const edits = await waitFor(async () => {
+    const e = (await sent()).filter(m => m.method === 'editMessageText' && m.message_id === bar?.message_id)
+    return e.some(m => String(m.text).startsWith('✅')) ? e : undefined
+  }, 10_000, 'progress done edit')
+  check(edits?.some(m => String(m.text).includes('▸ этап 2') && String(m.text).startsWith('⏳')), 'progress stage: the bar shows the new stage')
+  const fin = edits?.find(m => String(m.text).startsWith('✅'))
+  check(fin?.text === '✅ Рендер\n▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓ 100%\nготово', `progress done: 100% with the final line (${JSON.stringify(fin?.text)})`)
+  const nAfter = (await sent()).filter(m => m.method === 'editMessageText' && m.message_id === bar?.message_id).length
+  await Bun.sleep(1000)
+  check((await sent()).filter(m => m.method === 'editMessageText' && m.message_id === bar?.message_id).length === nAfter, 'after done the timer stops editing')
+
+  await push(groupMsg(-1001, 10, 'прогресс файл'))
+  const bar2 = await replyTo(-1001, /^⏳ Отправка/, 15_000)
+  const doc = await waitFor(async () => (await sent()).find(m => m.method === 'sendDocument' && m.message_thread_id == 10), 10_000, 'result file sent')
+  const all2 = await sent()
+  const e2 = all2.filter(m => m.method === 'editMessageText' && m.message_id === bar2?.message_id)
+  const iUpload = all2.findIndex(m => m.method === 'editMessageText' && m.message_id === bar2?.message_id && String(m.text).includes('📤 result.mp4'))
+  const iDoc = all2.findIndex(m => m.method === 'sendDocument' && m.message_id === doc?.message_id)
+  const iDone = all2.findIndex(m => m.method === 'editMessageText' && m.message_id === bar2?.message_id && String(m.text).startsWith('✅'))
+  check(iUpload >= 0 && iUpload < iDoc, 'reply with progress_id: the bar shows the upload before the file is sent')
+  check(iDone > iDoc && e2.at(-1)?.text.startsWith('✅ Отправка'), 'reply with progress_id: the bar turns ✅ only after Telegram has the file')
 
   // ---- M: command menu written on first connect
   const m1 = await menus()
