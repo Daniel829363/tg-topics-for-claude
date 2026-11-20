@@ -3,7 +3,7 @@
  * plugin as an MCP server over stdio, records every channel notification and
  * answers each one with reply (without thread_id — the plugin must route it).
  * Runs the session-state hooks the way Claude Code would: start on launch,
- * idle after each answered message (except "долгая задача" — still working).
+ * busy on each inbound message, idle after each answered message (except "долгая задача" — still working).
  */
 
 import { appendFileSync, writeFileSync } from 'fs'
@@ -61,6 +61,7 @@ function notify(method: string, params: unknown = {}): void {
       if (msg.id === 1 && msg.result) notify('notifications/initialized')
       if (msg.method === 'notifications/claude/channel') {
         record('inbound', msg.params)
+        hook('busy') // UserPromptSubmit: a turn starts (a slow idle hook of the previous turn must not wipe this one's mark)
         const meta = msg.params.meta
         rpc('tools/call', { name: 'reply', arguments: { chat_id: meta.chat_id, text: `echo[${route}]: ${msg.params.content}` } })
         if (String(msg.params.content).includes('прогресс')) {

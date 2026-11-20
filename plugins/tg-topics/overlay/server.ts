@@ -573,7 +573,7 @@ const mcp = new Server(
     instructions: [
       'The sender reads Telegram, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
       '',
-      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
+      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. If the tag has reply_to_message_id, the sender used Telegram\'s Reply on that earlier message: the content starts with a "[reply to message N from ...]" line and the quoted text (or only the highlighted fragment) as "> " lines, then the new message; reply_to_user "you (this bot)" means one of your own earlier messages; reply_to_attachment_file_id (if present) can be fetched with download_attachment. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
       '',
       'Group messages also carry chat_type and chat_title. Messages from a forum topic carry thread_id and topic (the topic name). Pass thread_id back to reply so the answer lands in the same topic — without it the reply goes to the last topic that chat wrote from.' +
         (TOPIC_SESSION
@@ -1258,6 +1258,64 @@ function safeName(s: string | undefined): string | undefined {
   return s?.replace(/[<>\[\]\r\n;]/g, '_')
 }
 
+// ---- Reply context (TG-TOPICS) ----
+// When the user answers a specific message (Telegram "Reply"), tell Claude which one:
+// meta gets reply_to_message_id / reply_to_user (+ the replied message's attachment, so it can
+// be fetched with download_attachment), and the content is prefixed with the quoted text
+// (or just the fragment the user highlighted). In forum topics every message carries
+// reply_to_message = the topic's creation service message; that is not a reply and is skipped.
+const REPLY_QUOTE_MAX = 1500
+
+function attachmentOf(r: any): AttachmentMeta | undefined {
+  if (r.photo?.length) {
+    const best = r.photo[r.photo.length - 1]
+    return { kind: 'photo', file_id: best.file_id, size: best.file_size, mime: 'image/jpeg' }
+  }
+  for (const kind of ['document', 'voice', 'audio', 'video', 'video_note', 'animation', 'sticker'] as const) {
+    const a = r[kind]
+    if (a?.file_id) return { kind, file_id: a.file_id, size: a.file_size, mime: a.mime_type, name: safeName(a.file_name) }
+  }
+  return undefined
+}
+
+function replyContext(m: any): { meta: Record<string, string>; prefix: string } | undefined {
+  const r = m?.reply_to_message
+  const realReply = r && !r.forum_topic_created
+  const ext = m?.external_reply
+  const quote: string | undefined = m?.quote?.text
+  if (!realReply && !ext && !quote) return undefined
+
+  const src = realReply ? r : ext ?? {}
+  const meta: Record<string, string> = {}
+  let who: string | undefined
+  if (realReply) {
+    meta.reply_to_message_id = String(r.message_id)
+    if (r.from?.is_bot && r.from.username === botUsername) who = 'you (this bot)'
+    else if (r.from) who = r.from.username ? `@${r.from.username}` : (r.from.first_name ?? String(r.from.id))
+    else if (r.sender_chat?.title) who = r.sender_chat.title
+  } else if (ext) {
+    const o = ext.origin ?? {}
+    who = o.sender_user?.username ? `@${o.sender_user.username}` : o.sender_user?.first_name ?? o.sender_user_name ?? o.chat?.title ?? 'another chat'
+    if (ext.message_id != null) meta.reply_to_message_id = String(ext.message_id)
+    meta.reply_external = 'true'
+  }
+  if (who) meta.reply_to_user = safeName(who)!
+
+  const att = attachmentOf(src)
+  if (att) {
+    rememberAttachment(att)
+    meta.reply_to_attachment_kind = att.kind
+    meta.reply_to_attachment_file_id = att.file_id
+    if (att.name) meta.reply_to_attachment_name = att.name
+  }
+
+  let body: string = quote ?? src.text ?? src.caption ?? (att ? `(${att.kind}${att.name ? `: ${att.name}` : ''})` : '')
+  if (body.length > REPLY_QUOTE_MAX) body = body.slice(0, REPLY_QUOTE_MAX) + '…'
+  const head = `[reply to ${meta.reply_to_message_id ? `message ${meta.reply_to_message_id}` : 'a message'}${who ? ` from ${who}` : ''}${quote ? ', quoted fragment' : ''}${ext && !realReply ? ' in another chat' : ''}]`
+  const quoted = body ? '\n' + body.split('\n').map(l => `> ${l}`).join('\n') : ''
+  return { meta, prefix: `${head}${quoted}\n\n` }
+}
+
 async function handleInbound(
   ctx: Context,
   text: string,
@@ -1327,6 +1385,7 @@ async function handleInbound(
   }
 
   const imagePath = downloadImage ? await downloadImage() : undefined
+  const reply = replyContext(msg)
 
   if (chat_id === ROUTE_CHAT && thread === ROUTE_THREAD) {
     logHistory({
@@ -1334,6 +1393,7 @@ async function handleInbound(
       message_id: msgId,
       user: from.username ?? String(from.id),
       text,
+      ...(reply?.meta.reply_to_message_id ? { reply_to: reply.meta.reply_to_message_id } : {}),
       ...(imagePath ? { image_path: imagePath } : {}),
       ...(attachment ? { attachment: `${attachment.kind}${attachment.name ? `: ${attachment.name}` : ''}` } : {}),
     })
@@ -1345,9 +1405,10 @@ async function handleInbound(
   mcp.notification({
     method: 'notifications/claude/channel',
     params: {
-      content: text,
+      content: reply ? reply.prefix + text : text,
       meta: {
         chat_id,
+        ...(reply ? reply.meta : {}),
         ...(msgId != null ? { message_id: String(msgId) } : {}),
         user: from.username ?? String(from.id),
         user_id: String(from.id),

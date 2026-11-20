@@ -177,6 +177,27 @@ try {
   const hist = existsSync(join(ws, 'history.jsonl')) ? readFileSync(join(ws, 'history.jsonl'), 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l)) : []
   check(hist.some(h => h.dir === 'in' && h.text === 'задача A') && hist.some(h => h.dir === 'out'), 'history.jsonl records inbound and outbound')
 
+  // ---- R: Telegram Reply — the session learns which message was answered (text, author, quote, attachment)
+  check(!('reply_to_message_id' in meta) && !String(inbound[0]?.data.content).startsWith('[reply'), 'topic root reply_to_message is not treated as a reply')
+  const botMsg = { message_id: 500, date: 0, chat: { id: -1001, type: 'supergroup', is_forum: true }, from: { id: 999, is_bot: true, first_name: 'Bot', username: 'test_bot' }, message_thread_id: 10, is_topic_message: true, text: 'Вариант 1: синий фон\nВариант 2: красный фон' }
+  await push(groupMsg(-1001, 10, 'берём этот', { reply_to_message: botMsg }))
+  await push(groupMsg(-1001, 10, 'а этот кусок', { reply_to_message: botMsg, quote: { text: 'красный фон', position: 0 } }))
+  const userPhoto = { message_id: 501, date: 0, chat: { id: -1001, type: 'supergroup', is_forum: true }, from: { id: 111, is_bot: false, first_name: 'U', username: 'owner' }, message_thread_id: 10, is_topic_message: true, photo: [{ file_id: 'small', file_unique_id: 's', width: 1, height: 1 }, { file_id: 'BIGPHOTO', file_unique_id: 'b', width: 9, height: 9, file_size: 1234 }], caption: 'обложка' }
+  await push(groupMsg(-1001, 10, 'сделай так же', { reply_to_message: userPhoto }))
+  const rIn = await waitFor(async () => {
+    const r = sessions().filter(s => s.kind === 'inbound' && s.route === '-1001:10' && String(s.data.content).startsWith('[reply'))
+    return r.length >= 3 ? r : undefined
+  }, 15_000, '3 reply inbounds')
+  const rFull = rIn?.find(s => String(s.data.content).endsWith('берём этот'))
+  check(rFull?.data.meta.reply_to_message_id === '500' && rFull.data.meta.reply_to_user === 'you (this bot)'
+    && String(rFull.data.content).startsWith('[reply to message 500 from you (this bot)]\n> Вариант 1: синий фон\n> Вариант 2: красный фон\n\nберём этот'),
+    `reply to a bot message: id, author and quoted text reach the session (${JSON.stringify(rFull?.data.content)})`)
+  const rQuote = rIn?.find(s => String(s.data.content).endsWith('а этот кусок'))
+  check(String(rQuote?.data.content).includes('quoted fragment]\n> красный фон\n\n') && !String(rQuote?.data.content).includes('синий'), 'partial quote: only the highlighted fragment is passed')
+  const rPhoto = rIn?.find(s => String(s.data.content).endsWith('сделай так же'))
+  check(rPhoto?.data.meta.reply_to_attachment_kind === 'photo' && rPhoto.data.meta.reply_to_attachment_file_id === 'BIGPHOTO' && rPhoto.data.meta.reply_to_user === '@owner'
+    && String(rPhoto.data.content).includes('> обложка'), 'reply to a photo: largest photo file_id + caption passed')
+
   // ---- P: progress tool — the server keeps editing the bar on its own until done
   await push(groupMsg(-1001, 10, 'прогресс рендера'))
   const bar = await replyTo(-1001, /^⏳ Рендер/, 15_000)
@@ -324,7 +345,7 @@ try {
   const before = await status()
   const liveBefore: string[] = [...(before?.live ?? [])].sort()
   check(liveBefore.join() === ['-1001:20', '-1002:5', 'dm'].join(), `live.json lists the running sessions (${liveBefore.join(', ')})`)
-  check(existsSync(busyFile('-1001:20')) && !existsSync(busyFile('-1002:5')), 'the route mid-task is marked busy, finished ones are not')
+  check(existsSync(busyFile('-1001:20')) && !existsSync(busyFile('-1002:5')), `the route mid-task is marked busy, finished ones are not (${['-1001:20','-1002:5'].map(r => r + '=' + (existsSync(busyFile(r)) ? readFileSync(busyFile(r), 'utf8') : '-')).join('; ')})`)
   check(JSON.parse(readFileSync(join(TMP, 'router-state', 'sessions', '-1001_20.json'), 'utf8')).session_id === 'fake--1001:20', 'SessionStart hook saved the session id')
   router.kill()
   await router.exited
