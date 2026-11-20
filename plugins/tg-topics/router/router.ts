@@ -230,6 +230,23 @@ const clients = new Map<string, Client>()
 const pending = new Map<string, { at: number; chat_id?: string; thread?: number }>()
 const queues = new Map<string, { at: number; payload: string }[]>()
 
+// Messages waiting for a starting session are on disk too (state/queue.json): Telegram already
+// counts them as delivered, so a router restart (a tg-topics update, a hand-over to a new router)
+// must not drop them. A pending start survives only while its session can still connect.
+type QueueFile = { pending?: Record<string, { at: number; chat_id?: string; thread?: number }>; queues?: Record<string, { at: number; payload: string }[]> }
+{
+  const saved = loadJson<QueueFile>('queue.json', {})
+  const now = Date.now()
+  for (const [r, p] of Object.entries(saved.pending ?? {})) if (now - p.at < cfg.spawnTimeoutSec * 1000) pending.set(r, p)
+  for (const [r, items] of Object.entries(saved.queues ?? {})) {
+    const fresh = (items ?? []).filter(i => now - i.at < cfg.queueTtlSec * 1000)
+    if (fresh.length) queues.set(r, fresh)
+  }
+}
+function saveQueue(): void {
+  try { saveJson('queue.json', { pending: Object.fromEntries(pending), queues: Object.fromEntries(queues) } satisfies QueueFile) } catch (err) { log('cannot save queue.json:', String(err)) }
+}
+
 function send(route: string, payload: string): boolean {
   const c = clients.get(route)
   if (!c) return false
@@ -245,12 +262,14 @@ function enqueue(route: string, payload: string): void {
   const q = queues.get(route) ?? []
   q.push({ at: Date.now(), payload })
   queues.set(route, q)
+  saveQueue()
 }
 
 function flush(route: string): void {
   const q = queues.get(route)
   if (!q) return
   queues.delete(route)
+  saveQueue()
   const fresh = q.filter(i => Date.now() - i.at < cfg.queueTtlSec * 1000)
   for (const i of fresh) send(route, i.payload)
   if (fresh.length) log(`flushed ${fresh.length} queued update(s) to ${route}`)
@@ -496,6 +515,7 @@ function startSession(route: string, msg: any): void {
     log(`not starting ${route}: session limit ${cfg.maxSessions} reached`)
     notify(target, thread, `⚠️ Лимит параллельных сессий (${cfg.maxSessions}) исчерпан. Закрой ненужную: /sessions → /stop N, или подними лимит: /maxsessions ${Math.min(cfg.maxSessions + 4, MAX_SESSIONS_CAP)}. Потом повтори сообщение.`)
     queues.delete(route)
+    saveQueue()
     return
   }
   // A topic whose session was cut off (reboot, power loss) gets its old
@@ -512,6 +532,7 @@ function startSession(route: string, msg: any): void {
 
 function openSession(route: string, chat_id: string | undefined, thread: number | undefined, resume?: string): boolean {
   pending.set(route, { at: Date.now(), chat_id, thread })
+  saveQueue()
   try {
     const ws = prepareWorkspace(route, resume)
     launch(ws)
@@ -521,6 +542,7 @@ function openSession(route: string, chat_id: string | undefined, thread: number 
     pending.delete(route)
     queues.delete(route)
     resuming.delete(route)
+    saveQueue()
     log(`failed to start session for ${route}:`, String(err))
     if (chat_id) notify(chat_id, thread, `⚠️ Не удалось запустить сессию: ${err}`)
     return false
@@ -723,6 +745,7 @@ function setMaxSessions(n: number): void {
 // late connect until it expires.
 setInterval(() => {
   const now = Date.now()
+  const before = JSON.stringify([[...pending.keys()], [...queues].map(([k, q]) => [k, q.length])])
   for (const [route, p] of pending) {
     if (now - p.at > cfg.spawnTimeoutSec * 1000) {
       pending.delete(route)
@@ -735,6 +758,7 @@ setInterval(() => {
     if (fresh.length) queues.set(route, fresh)
     else queues.delete(route)
   }
+  if (JSON.stringify([[...pending.keys()], [...queues].map(([k, q]) => [k, q.length])]) !== before) saveQueue()
 }, 15_000)
 
 // ---- Plugin overlay upkeep --------------------------------------------------
@@ -855,7 +879,7 @@ const server = (() => {
           }
           ws.data.route = route
           clients.set(route, { ws, route, pid: m.pid, dir: m.dir, since: Date.now() })
-          pending.delete(route)
+          if (pending.delete(route)) saveQueue()
           ws.send(JSON.stringify({ t: 'welcome', route, info: infoFor(route) }))
           log(`session connected: ${route}${old ? ' (replaced previous)' : ''} pid=${m.pid} dir=${m.dir}`)
           markLive(route)

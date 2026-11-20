@@ -66,6 +66,7 @@ const env = {
   TG_TEST_OUT: TMP,
   TG_TEST_TOPICS: PLUGIN,
   TELEGRAM_PROGRESS_TICK_MS: '300',
+  TG_TEST_SLOW_ROUTE: '-1001:30',
 }
 delete (env as any).TELEGRAM_ROUTE
 delete (env as any).TELEGRAM_TOPIC_DIR
@@ -362,6 +363,24 @@ try {
   await Bun.sleep(1500)
   check(!sessions().some(s => s.kind === 'inbound' && s.route !== '-1001:20' && String(s.data.content).startsWith('⚡')), 'idle sessions were reopened without a prompt')
   check(await replyTo(111, /♻️.*восстанавливаю сессии \(3\).*Продолжат прерванную работу: Тест группа \/ Сценарии/s), 'the owner gets one DM listing the restored sessions')
+
+  // ---- Q: messages sent while a session is still starting survive a router restart — all of them, in order
+  await push(groupMsg(-1001, 30, 'очередь 1', { reply_to_message: topicRoot(30, 'Очередь') }))
+  await waitFor(async () => ((await status())?.starting ?? []).includes('-1001:30') || undefined, 10_000, 'topic 30 starting')
+  await push(groupMsg(-1001, 30, 'очередь 2'))
+  await push(groupMsg(-1001, 30, 'очередь 3'))
+  await waitFor(async () => (((await status())?.queued ?? {})['-1001:30'] >= 3) || undefined, 5000, '3 queued')
+  router.kill()
+  await router.exited
+  router = startRouter()
+  await waitFor(status, 5000, 'router up again')
+  await push(groupMsg(-1001, 30, 'очередь 4'))
+  const got = await waitFor(async () => {
+    const s = sessions().filter(s => s.kind === 'inbound' && s.route === '-1001:30').map(s => String(s.data.content))
+    return s.length >= 4 ? s : undefined
+  }, 30_000, '4 queued messages delivered')
+  check(got?.join('|') === 'очередь 1|очередь 2|очередь 3|очередь 4', `all messages sent before the session connected arrive, in order, across a router restart (${got?.join('|')})`)
+  check(sessions().filter(s => s.kind === 'spawned' && s.route === '-1001:30').length === 1, 'the restart did not open a second session for the starting topic')
 } finally {
   router.kill()
   for (const s of sessions().filter(s => s.kind === 'spawned')) { try { process.kill(s.pid) } catch {} }

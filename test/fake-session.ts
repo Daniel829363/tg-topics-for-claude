@@ -22,6 +22,9 @@ function hook(mode: string, input: unknown = {}): void {
 }
 hook('start', { session_id: `fake-${route}`, source: process.env.TELEGRAM_RESUME ? 'resume' : 'startup', cwd: process.cwd() })
 
+// A slow start (Claude Code takes a while to boot): messages for this route queue up in the router meanwhile.
+if (process.env.TG_TEST_SLOW_ROUTE === route && !process.env.TELEGRAM_RESUME) await Bun.sleep(6000)
+
 const child = Bun.spawn(['bun', join(PLUGIN, 'server.ts')], {
   cwd: PLUGIN,
   env: process.env,

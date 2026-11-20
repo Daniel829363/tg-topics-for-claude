@@ -72,6 +72,17 @@ function selfKey(): string {
   return 'tg-topics@tg-topics'
 }
 
+/** The plugin copy launch-router.ts starts the router from (the newest install), and its version. */
+function launcherTarget(): { root: string; version: string } {
+  const best = installsOf(selfKey())
+    .filter(i => existsSync(join(i.installPath, 'router', 'router.ts')))
+    .sort((a, b) => String(b.lastUpdated ?? '').localeCompare(String(a.lastUpdated ?? '')))[0]
+  if (!best) return { root: PLUGIN_ROOT, version: PLUGIN_VERSION }
+  let version = best.version ?? '0'
+  try { version = JSON.parse(readFileSync(join(best.installPath, '.claude-plugin', 'plugin.json'), 'utf8')).version ?? version } catch {}
+  return { root: best.installPath, version }
+}
+
 // Locations a non-default setup may override. The router is started via WMI
 // or at sign-in and inherits none of our environment, so they're baked in.
 const CARRIED_ENV = ['CLAUDE_CONFIG_DIR', 'TG_ROUTER_HOME', 'TG_ROUTER_CONFIG', 'TG_ROUTER_STATE', 'TG_ROUTER_LOG', 'TELEGRAM_STATE_DIR', 'TELEGRAM_API_ROOT']
@@ -435,13 +446,19 @@ async function status(): Promise<void> {
 async function hookStart(): Promise<void> {
   // Quiet upkeep on every session start; does nothing before /tg-topics:setup.
   if (!existsSync(CONFIG_FILE)) return
-  const changed = cfg.plugin.autoPatch ? applyOverlay(cfg).filter(r => r.changed) : []
+  // Hooks can run from another copy than the router (a session started from the dev folder, or
+  // before the plugin cache was updated). Only the copy the router starts from touches the overlay,
+  // and the router is restarted only when a restart would actually bring a different version;
+  // otherwise every new session restarted it for nothing and the two copies fought over server.ts.
+  const target = launcherTarget()
+  const own = resolve(target.root).toLowerCase() === resolve(PLUGIN_ROOT).toLowerCase()
+  const changed = cfg.plugin.autoPatch && own ? applyOverlay(cfg).filter(r => r.changed) : []
   writeLaunchers()
   const h = await health()
   if (!h) {
     if (readToken(cfg)) await startRouter()
-  } else if (h.version !== PLUGIN_VERSION) {
-    // tg-topics was updated: hand over to the new router (sessions reconnect).
+  } else if (h.version !== target.version) {
+    // tg-topics was updated: hand over to the new router (sessions reconnect, queued messages are on disk).
     await stopRouter()
     await startRouter()
   }
