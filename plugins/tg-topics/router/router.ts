@@ -224,7 +224,7 @@ function learn(msg: any): void {
 // ---- Sessions ---------------------------------------------------------------
 
 type WsData = { route?: string }
-type Client = { ws: ServerWebSocket<WsData>; route: string; pid?: number; dir?: string; since: number }
+type Client = { ws: ServerWebSocket<WsData>; route: string; pid?: number; dir?: string; since: number; caps: string[] }
 
 const clients = new Map<string, Client>()
 const pending = new Map<string, { at: number; chat_id?: string; thread?: number }>()
@@ -645,6 +645,10 @@ function handOff(from: string | undefined, fromLabel: string, to: string, text: 
   const chat_id = to === 'dm' ? ownerChat() : parseRoute(to).chat_id
   if (!chat_id) throw new Error('the main session has no owner chat yet — the owner has to DM the bot once')
 
+  const running = clients.get(to)
+  if (running && !running.caps.includes('peer')) {
+    throw new Error(`«${labelOf(to)}» runs an older tg-topics overlay that cannot take hand-offs — it needs a restart first (/stop in that topic, then any message there starts it again)`)
+  }
   const payload = JSON.stringify({ t: 'peer', from: from ?? 'terminal', from_label: fromLabel, text, files, chat_id, thread, info: infoFor(to), ts: new Date().toISOString() })
   let state: PeerResult['state']
   if (send(to, payload)) state = 'delivered'
@@ -1068,7 +1072,7 @@ const server = (() => {
             old.ws.close()
           }
           ws.data.route = route
-          clients.set(route, { ws, route, pid: m.pid, dir: m.dir, since: Date.now() })
+          clients.set(route, { ws, route, pid: m.pid, dir: m.dir, since: Date.now(), caps: Array.isArray(m.caps) ? m.caps.map(String) : [] })
           lastActive.set(route, Date.now())
           if (pending.delete(route)) saveQueue()
           ws.send(JSON.stringify({ t: 'welcome', route, info: infoFor(route) }))

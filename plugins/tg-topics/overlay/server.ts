@@ -1564,6 +1564,8 @@ function connectRouter(attempt: number): void {
       secret: readRouterSecret(),
       pid: process.pid,
       dir: TOPIC_DIR ?? process.cwd(),
+      // What this server understands beyond Telegram updates (older ones drop hand-offs).
+      caps: ['peer'],
     }))
   }
   ws.onmessage = ev => {

@@ -433,6 +433,14 @@ try {
   check(tsend.code === 0 && tsend.out.includes('доставлено'), `terminal: tgt send dm … (${tsend.out.trim()})`)
   const dmIn = await waitFor(() => peerIn('dm', /проверка из терминала/), 10_000, 'terminal hand-off in dm')
   check(dmIn?.data.meta.chat_id === '111' && dmIn.data.meta.from_label === 'Терминал' && !dmIn.data.meta.thread_id, 'the main session gets it with the owner\'s DM as its chat')
+  // a session still running an older overlay (no 'peer' in its hello caps) would drop a hand-off: refuse instead
+  const oldWs = new WebSocket('ws://127.0.0.1:18789/ws')
+  await new Promise(r => { oldWs.onopen = r })
+  oldWs.send(JSON.stringify({ t: 'hello', route: '-1001:30', secret: readFileSync(join(STATE_TG, 'router.secret'), 'utf8').trim(), pid: 1, dir: TMP }))
+  await waitFor(async () => (await status())?.sessions?.some((s: any) => s.route === '-1001:30'), 5000, 'old-style session connected')
+  const told = tgt('send', '-1001:30', 'x')
+  check(told.code === 1 && told.out.includes('older tg-topics overlay'), `a running session with an older overlay is refused, not silently skipped (${told.out.trim()})`)
+  oldWs.close()
   const hist10 = readFileSync(join(TMP, 'topics', 'test-gruppa', 'video-montazh-10', 'history.jsonl'), 'utf8')
   check(hist10.includes('"user":"session:Тест группа / Сценарии"'), 'the hand-off is in the target topic\'s history.jsonl')
 } finally {
