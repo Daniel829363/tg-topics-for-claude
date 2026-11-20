@@ -67,6 +67,13 @@ function notify(method: string, params: unknown = {}): void {
         hook('busy') // UserPromptSubmit: a turn starts (a slow idle hook of the previous turn must not wipe this one's mark)
         const meta = msg.params.meta
         rpc('tools/call', { name: 'reply', arguments: { chat_id: meta.chat_id, text: `echo[${route}]: ${msg.params.content}` } })
+        // Hand-offs between sessions: "передай в <тема>: <текст>" → send_to_session; a hand-off with
+        // "верни" sends a result back to its sender; "список сессий" → the sessions tool.
+        const content = String(msg.params.content)
+        const handOff = /передай в ([^:]+): (.+)/.exec(content)
+        if (handOff && meta.source !== 'tg-topics-peer') rpc('tools/call', { name: 'send_to_session', arguments: { to: handOff[1], text: handOff[2] } })
+        if (meta.source === 'tg-topics-peer' && content.includes('верни')) rpc('tools/call', { name: 'send_to_session', arguments: { to: meta.from_route, text: 'результат готов' } })
+        if (content.includes('список сессий')) rpc('tools/call', { name: 'sessions', arguments: {} })
         if (String(msg.params.content).includes('прогресс')) {
           finishWith = String(msg.params.content).includes('файл') ? 'file' : 'done'
           rpc('tools/call', { name: 'progress', arguments: { action: 'start', chat_id: meta.chat_id, title: finishWith === 'file' ? 'Отправка' : 'Рендер', eta: '3s', stage: 'этап 1' } })

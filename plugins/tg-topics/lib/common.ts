@@ -45,6 +45,8 @@ export type Config = {
   spawnTimeoutSec: number
   queueTtlSec: number
   announceSpawn: boolean
+  /** Post "📨 Задача от «…»" into the target topic when one session hands a task to another. */
+  peerEcho: boolean
   /** After a reboot / power loss, reopen the sessions that were running (claude --resume). */
   resumeOnStart: boolean
   /** How long the router waits after its start for still-running sessions to reconnect before resuming the rest. */
@@ -79,6 +81,7 @@ export function defaultConfig(): Config {
     spawnTimeoutSec: 180,
     queueTtlSec: 900,
     announceSpawn: true,
+    peerEcho: true,
     resumeOnStart: true,
     resumeGraceSec: 45,
     dm: { spawn: true, dir: homedir() },

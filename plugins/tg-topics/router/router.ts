@@ -370,7 +370,7 @@ function handleUpdate(u: any): void {
 
   const payload = JSON.stringify({ t: 'update', key: route, info: infoFor(route), update: u })
   if (send(route, payload)) {
-    markBusy(route, msg)
+    markBusy(route, String(msg.chat.id))
     return
   }
 
@@ -379,13 +379,13 @@ function handleUpdate(u: any): void {
   // chatter that doesn't mention the bot never opens a terminal.
   if (pending.has(route)) {
     enqueue(route, payload)
-    markBusy(route, msg)
+    markBusy(route, String(msg.chat.id))
     return
   }
   if (!wouldDeliver(route, msg)) return
   enqueue(route, payload)
   startSession(route, msg)
-  if (pending.has(route)) markBusy(route, msg)
+  if (pending.has(route)) markBusy(route, String(msg.chat.id))
 }
 
 // ---- Workspaces -------------------------------------------------------------
@@ -551,26 +551,142 @@ function launch(ws: Workspace): void {
 }
 
 function startSession(route: string, msg: any): void {
-  const { chat_id, thread } = parseRoute(route)
-  const target = route === 'dm' ? String(msg.chat.id) : chat_id!
-  if (route === 'dm' && !cfg.dm.spawn) return
+  spawnRoute(route, route === 'dm' ? String(msg.chat.id) : parseRoute(route).chat_id!)
+}
+
+/**
+ * Opens a session for a route nobody serves. Returns '' when it is starting,
+ * otherwise why not. quiet: no Telegram notices (a hand-off from another
+ * session reports to its sender instead).
+ */
+function spawnRoute(route: string, target: string | undefined, quiet = false): string {
+  const { thread } = parseRoute(route)
+  if (route === 'dm' && !cfg.dm.spawn) return 'the main (dm) session is not started by the router (dm.spawn is off)'
   if (clients.size + pending.size >= cfg.maxSessions) {
     log(`not starting ${route}: session limit ${cfg.maxSessions} reached`)
-    notify(target, thread, `⚠️ Лимит параллельных сессий (${cfg.maxSessions}) исчерпан. Закрой ненужную: /sessions → /stop N, или подними лимит: /maxsessions ${Math.min(cfg.maxSessions + 4, MAX_SESSIONS_CAP)}. Потом повтори сообщение.`)
+    if (!quiet && target) notify(target, thread, `⚠️ Лимит параллельных сессий (${cfg.maxSessions}) исчерпан. Закрой ненужную: /sessions → /stop N, или подними лимит: /maxsessions ${Math.min(cfg.maxSessions + 4, MAX_SESSIONS_CAP)}. Потом повтори сообщение.`)
     queues.delete(route)
     saveQueue()
-    return
+    return `the parallel session limit (${cfg.maxSessions}) is reached — the user can close one with /stop N or raise it with /maxsessions`
   }
   // A topic whose session was cut off (reboot, power loss) gets its old
   // conversation back, even when a message beats the startup resume.
   const resume = live[route] ? resumeArg(route) : undefined
   if (resume) resuming.set(route, { busy: isBusy(route), chat_id: target, thread })
-  if (!openSession(route, target, thread, resume)) return
-  if (cfg.announceSpawn && route !== 'dm') {
+  if (!openSession(route, target, thread, resume)) return 'the session could not be launched (see the router log)'
+  if (!quiet && cfg.announceSpawn && route !== 'dm' && target) {
     notify(target, thread, resume
       ? `♻️ Восстанавливаю сессию темы «${infoFor(route)?.topic ?? route}» после перезапуска — ответ через ~20–30 сек.`
       : `🚀 Запускаю отдельную сессию для темы «${infoFor(route)?.topic ?? route}» — первый ответ через ~20–30 сек.`)
   }
+  return ''
+}
+
+// ---- Hand-offs between sessions ----------------------------------------------
+// A session gives another one a task with its send_to_session tool (or the
+// terminal with `tgt send`). The router delivers it like a Telegram message:
+// straight away when the target runs, queued while it starts, and it starts a
+// closed one itself — so the user doesn't have to write in that topic.
+
+const PEER_TEXT_MAX = 20_000
+const PEER_WINDOW_MS = 10 * 60_000
+const PEER_MAX_PER_WINDOW = 12
+const peerSent = new Map<string, number[]>()
+
+/** The owner's DM — where the main session reports. */
+function ownerChat(): string | undefined {
+  return live.dm?.chat_id ?? loadAccess().allowFrom[0]
+}
+
+/** Routes a hand-off may go to: the main session and the topics of connected groups. */
+function knownRoutes(): string[] {
+  const access = loadAccess()
+  const all = new Set<string>(['dm', ...Object.keys(routes), ...Object.keys(topics), ...clients.keys()])
+  return [...all].filter(r => r === 'dm' || Boolean(access.groups[parseRoute(r).chat_id!]))
+}
+
+function stateOf(route: string): 'running' | 'starting' | 'closed' {
+  return clients.has(route) ? 'running' : pending.has(route) ? 'starting' : 'closed'
+}
+
+function peerList(from?: string): { route: string; label: string; chat_title?: string; topic?: string; state: string; you?: boolean }[] {
+  return knownRoutes()
+    .map(route => ({ route, label: labelOf(route), ...infoFor(route), state: stateOf(route), ...(route === from ? { you: true } : {}) }))
+    .sort((a, b) => Number(b.route === 'dm') - Number(a.route === 'dm') || a.label.localeCompare(b.label))
+}
+
+const DM_ALIASES = new Set(['dm', 'личка', 'лс', 'основная', 'главная', 'main session'])
+
+/** "Видео монтаж", "Группа / Видео монтаж", "-100123:45" or "dm" → a route. */
+function resolvePeer(query: string): { route?: string; error?: string } {
+  const q = query.trim()
+  const low = q.toLowerCase().replace(/^«|»$/g, '')
+  const all = knownRoutes()
+  if (all.includes(q)) return { route: q }
+  if (DM_ALIASES.has(low)) return { route: 'dm' }
+  const names = (r: string) => [labelOf(r).toLowerCase(), (infoFor(r)?.topic ?? '').toLowerCase()].filter(Boolean)
+  let hits = all.filter(r => names(r).some(n => n === low))
+  if (!hits.length && low) hits = all.filter(r => names(r).some(n => n.includes(low)))
+  if (hits.length === 1) return { route: hits[0] }
+  const list = (rs: string[]) => rs.map(r => `«${labelOf(r)}» (${r})`).join(', ')
+  if (!hits.length) return { error: `no session matches "${q}". Known: ${list(all)}` }
+  return { error: `"${q}" matches several sessions: ${list(hits)} — pass the route instead` }
+}
+
+type PeerResult = { route: string; label: string; state: 'delivered' | 'queued' | 'started' }
+
+function handOff(from: string | undefined, fromLabel: string, to: string, text: string, files: string[]): PeerResult {
+  if (to === from) throw new Error('that is this session itself')
+  const now = Date.now()
+  const key = `${from ?? 'terminal'}→${to}`
+  const recent = (peerSent.get(key) ?? []).filter(t => now - t < PEER_WINDOW_MS)
+  if (recent.length >= PEER_MAX_PER_WINDOW) throw new Error(`too many hand-offs to «${labelOf(to)}» in 10 minutes (${PEER_MAX_PER_WINDOW}) — wait for its answer instead of sending more`)
+  const { thread } = parseRoute(to)
+  const chat_id = to === 'dm' ? ownerChat() : parseRoute(to).chat_id
+  if (!chat_id) throw new Error('the main session has no owner chat yet — the owner has to DM the bot once')
+
+  const payload = JSON.stringify({ t: 'peer', from: from ?? 'terminal', from_label: fromLabel, text, files, chat_id, thread, info: infoFor(to), ts: new Date().toISOString() })
+  let state: PeerResult['state']
+  if (send(to, payload)) state = 'delivered'
+  else if (pending.has(to)) { enqueue(to, payload); state = 'queued' }
+  else {
+    enqueue(to, payload)
+    const why = spawnRoute(to, chat_id, true)
+    if (why) {
+      queues.delete(to)
+      saveQueue()
+      throw new Error(why)
+    }
+    state = 'started'
+  }
+  recent.push(now)
+  peerSent.set(key, recent)
+  markBusy(to, chat_id)
+  log(`hand-off ${from ?? 'terminal'} → ${to}: ${state} (${text.length} chars${files.length ? `, ${files.length} file(s)` : ''})`)
+  if (cfg.peerEcho) {
+    const short = text.length > 3000 ? text.slice(0, 3000) + '…' : text
+    notify(chat_id, thread, [
+      `📨 Задача от «${fromLabel}»:`,
+      short,
+      ...(files.length ? [`📎 Файлы: ${files.map(f => f.split(/[\\/]/).pop()).join(', ')}`] : []),
+      ...(state === 'started' ? ['', '🚀 Запускаю сессию этой темы — она возьмётся за задачу через ~20–30 сек.'] : []),
+    ].join('\n'))
+  }
+  return { route: to, label: labelOf(to), state }
+}
+
+async function handleRpc(from: string, op: string, args: any): Promise<unknown> {
+  if (op === 'sessions') return { you: from, sessions: peerList(from) }
+  if (op === 'send') {
+    const text = String(args.text ?? '').trim()
+    if (!text) throw new Error('text is empty')
+    if (text.length > PEER_TEXT_MAX) throw new Error(`text is too long (${text.length} > ${PEER_TEXT_MAX}) — put it in a file and pass its path in files`)
+    const files = Array.isArray(args.files) ? args.files.map(String) : []
+    const r = resolvePeer(String(args.to ?? ''))
+    if (!r.route) throw new Error(r.error)
+    return handOff(from, labelOf(from), r.route, text, files)
+  }
+  throw new Error(`unknown op "${op}" — update tg-topics`)
 }
 
 function openSession(route: string, chat_id: string | undefined, thread: number | undefined, resume?: string): boolean {
@@ -633,13 +749,12 @@ function dropLive(route: string): void {
 }
 
 /** A message went to this route's session: it has work to finish after a reboot. */
-function markBusy(route: string, msg: any): void {
+function markBusy(route: string, chat_id: string): void {
   try {
     mkdirSync(join(STATE, 'busy'), { recursive: true })
     writeFileSync(routeFile('busy', route), new Date().toISOString())
   } catch {}
   // The main session's chat isn't part of its route — remember where to report.
-  const chat_id = String(msg.chat.id)
   if (route === 'dm' && live[route] && live[route].chat_id !== chat_id) {
     live[route].chat_id = chat_id
     saveJson('live.json', live)
@@ -877,8 +992,21 @@ const server = (() => {
         if (url.pathname === '/control' && req.method === 'POST') {
           if (req.headers.get('x-tg-router-secret') !== SECRET) return new Response('forbidden', { status: 403 })
           return (async () => {
-            const body = (await req.json().catch(() => ({}))) as { stop?: string[]; maxSessions?: number; idleCloseMin?: number }
+            const body = (await req.json().catch(() => ({}))) as { stop?: string[]; maxSessions?: number; idleCloseMin?: number; send?: { to?: string; text?: string; files?: string[] }; peers?: boolean }
             if (Array.isArray(body.stop)) return Response.json({ closed: await stopSessions(body.stop.map(String)) })
+            if (body.peers) return Response.json({ sessions: peerList() })
+            if (body.send) {
+              // From the terminal (tgt send): same delivery as a session's hand-off.
+              try {
+                const text = String(body.send.text ?? '').trim()
+                if (!text) throw new Error('text is empty')
+                const r = resolvePeer(String(body.send.to ?? ''))
+                if (!r.route) throw new Error(r.error)
+                return Response.json(handOff(undefined, 'Терминал', r.route, text, (body.send.files ?? []).map(String)))
+              } catch (err) {
+                return Response.json({ error: err instanceof Error ? err.message : String(err) }, { status: 400 })
+              }
+            }
             if (body.idleCloseMin !== undefined) {
               const v = body.idleCloseMin
               if (!Number.isInteger(v) || (v !== 0 && (v < IDLE_MIN || v > IDLE_MAX))) return Response.json({ error: `idleCloseMin: 0 or ${IDLE_MIN}..${IDLE_MAX}` }, { status: 400 })
@@ -915,6 +1043,17 @@ const server = (() => {
         message(ws, raw) {
           let m: any
           try { m = JSON.parse(String(raw)) } catch { return }
+          if (m.t === 'rpc') {
+            // Only a registered session (it passed the secret in hello) may call.
+            const from = ws.data.route
+            const answer = (body: Record<string, unknown>) => { try { ws.send(JSON.stringify({ t: 'rpc_result', id: m.id, ...body })) } catch {} }
+            if (!from || clients.get(from)?.ws !== ws) return answer({ error: 'this session is not registered with the router' })
+            void handleRpc(from, String(m.op), m.args ?? {}).then(
+              result => answer({ result }),
+              err => answer({ error: err instanceof Error ? err.message : String(err) }),
+            )
+            return
+          }
           if (m.t !== 'hello') return
           if (m.secret !== SECRET) {
             ws.send(JSON.stringify({ t: 'rejected', reason: 'bad secret' }))

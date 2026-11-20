@@ -402,6 +402,39 @@ try {
   check(await replyTo(-1001, /💤 Сессия закрыта: 5 мин без сообщений/), 'the closed topic gets a quiet 💤 notice')
   const tidle = tgt('idle', 'off')
   check(tidle.code === 0 && (await status())?.idleCloseMin === 0, `terminal: tgt idle off (${tidle.out.trim()})`)
+
+  // ---- H: hand-offs between sessions — one session gives another a task, starting it when closed
+  const toolResults = (route: string) => sessions().filter(s => s.kind === 'tool_result' && s.route === route).map(s => String(s.data))
+  const peerIn = (route: string, re: RegExp) => sessions().find(s => s.kind === 'inbound' && s.route === route && s.data.meta.source === 'tg-topics-peer' && re.test(String(s.data.content)))
+  check(!(await status())?.sessions?.some((s: any) => s.route === '-1001:10'), 'before the hand-off the "Видео монтаж" session is closed')
+  await push(groupMsg(-1001, 20, 'передай в Видео монтаж: смонтируй ролик и верни'))
+  const hIn = await waitFor(() => peerIn('-1001:10', /смонтируй ролик/), 60_000, 'hand-off reaches the closed topic')
+  check(hIn?.data.meta.from_route === '-1001:20' && hIn.data.meta.from_label === 'Тест группа / Сценарии' && hIn.data.meta.thread_id === '10' && hIn.data.meta.chat_id === '-1001'
+    && String(hIn.data.content).startsWith('[task from the session «Тест группа / Сценарии»'), `the closed session was started and got the task with its sender (${JSON.stringify(hIn?.data.meta)})`)
+  check(toolResults('-1001:20').some(t => t.includes('sent to «Тест группа / Видео монтаж»') && t.includes('was closed — started it')), 'the sender is told the target was closed and has been started')
+  const echo = await replyTo(-1001, /^📨 Задача от «Тест группа \/ Сценарии»:\nсмонтируй ролик и верни/)
+  check(echo?.message_thread_id == 10 && echo.text.includes('🚀 Запускаю сессию'), 'the target topic shows "📨 Задача от …" so the user sees the hand-off')
+  check(!(await sent()).some(m => m.message_thread_id == 10 && String(m.text).startsWith('🚀 Запускаю отдельную сессию') && m.message_id > (echo?.message_id ?? 0)), 'no separate spawn notice for a hand-off')
+  const hAns = await waitFor(async () => (await sent()).find(m => String(m.text).startsWith('echo[-1001:10]: [task from the session')), 15_000, 'target answers in its topic')
+  check(hAns?.message_thread_id == 10, 'the target reports in its own topic')
+  const hBack = await waitFor(() => peerIn('-1001:20', /результат готов/), 15_000, 'result sent back')
+  check(hBack?.data.meta.from_route === '-1001:10' && toolResults('-1001:10').some(t => t.includes('delivered (the session is running)')), 'the target sent the result back to the running sender with send_to_session')
+
+  await push(groupMsg(-1001, 20, 'передай в Несуществующая: x'))
+  check(await waitFor(() => toolResults('-1001:20').find(t => t.includes('no session matches "Несуществующая"')), 10_000, 'unknown target error'), 'an unknown target is refused with the list of known sessions')
+  await push(groupMsg(-1001, 20, 'передай в Сценарии: себе'))
+  check(await waitFor(() => toolResults('-1001:20').find(t => t.includes('that is this session itself')), 10_000, 'self error'), 'a session cannot hand a task to itself')
+  await push(groupMsg(-1001, 20, 'список сессий'))
+  const list = await waitFor(() => toolResults('-1001:20').find(t => t.includes('route dm')), 10_000, 'sessions list')
+  check(list?.includes('Тест группа / Сценарии — route -1001:20 — this session') && list.includes('Тест группа / Видео монтаж — route -1001:10 — running')
+    && !list.includes('-1003'), `sessions tool lists the reachable sessions with their state (${JSON.stringify(list)})`)
+
+  const tsend = tgt('send', 'dm', 'проверка', 'из', 'терминала')
+  check(tsend.code === 0 && tsend.out.includes('доставлено'), `terminal: tgt send dm … (${tsend.out.trim()})`)
+  const dmIn = await waitFor(() => peerIn('dm', /проверка из терминала/), 10_000, 'terminal hand-off in dm')
+  check(dmIn?.data.meta.chat_id === '111' && dmIn.data.meta.from_label === 'Терминал' && !dmIn.data.meta.thread_id, 'the main session gets it with the owner\'s DM as its chat')
+  const hist10 = readFileSync(join(TMP, 'topics', 'test-gruppa', 'video-montazh-10', 'history.jsonl'), 'utf8')
+  check(hist10.includes('"user":"session:Тест группа / Сценарии"'), 'the hand-off is in the target topic\'s history.jsonl')
 } finally {
   router.kill()
   for (const s of sessions().filter(s => s.kind === 'spawned')) { try { process.kill(s.pid) } catch {} }

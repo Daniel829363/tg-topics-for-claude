@@ -275,6 +275,36 @@ async function idleClose(arg: string | undefined): Promise<number> {
   return 0
 }
 
+/** tgt send <to> <text…> [--file <path>]… — hand a task to a session, starting it if closed. */
+async function sendTo(args: string[]): Promise<number> {
+  const files: string[] = []
+  const words: string[] = []
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--file' && args[i + 1]) files.push(resolve(args[++i]!))
+    else words.push(args[i]!)
+  }
+  const [to, ...textParts] = words
+  const post = (body: unknown) => fetch(`${routerHttp(cfg)}/control`, {
+    method: 'POST',
+    headers: { 'x-tg-router-secret': routerSecret(), 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(15_000),
+  })
+  if (!(await health())) { say('❌ роутер не запущен → tgt start'); return 1 }
+  if (!to || !textParts.length) {
+    say('tgt send <тема|route|dm> <текст задачи> [--file <путь>]…')
+    const res = await post({ peers: true }).catch(() => null)
+    if (res?.ok) for (const p of ((await res.json()) as { sessions: any[] }).sessions) say(`  ${p.state === 'running' ? '🟢' : p.state === 'starting' ? '⏳' : '⚪'} ${p.label}  [${p.route}]`)
+    return 1
+  }
+  for (const f of files) if (!existsSync(f)) { say(`❌ нет файла: ${f}`); return 1 }
+  const res = await post({ send: { to, text: textParts.join(' '), files } })
+  const r = (await res.json().catch(() => ({}))) as { error?: string; label?: string; state?: string }
+  if (!res.ok || r.error) { say(`❌ ${r.error ?? `роутер ответил ${res.status} (старая версия? → /tg-topics:router restart)`}`); return 1 }
+  say(`✅ «${r.label}»: ${r.state === 'delivered' ? 'доставлено' : r.state === 'queued' ? 'в очереди — сессия запускается' : 'сессия была закрыта — запустил, получит через ~20–30 сек'}`)
+  return 0
+}
+
 // ---- Settings -------------------------------------------------------------------
 
 function readJson(file: string): any {
@@ -533,6 +563,9 @@ try {
     case 'idle':
       code = await idleClose(rest[0])
       break
+    case 'send':
+      code = await sendTo(rest)
+      break
     case 'autostart':
       if (!IS_WIN) { say('автозапуск настраивается только на Windows; на macOS/Linux добавь `bun ' + LAUNCH_TS + '` в автозагрузку сам'); break }
       if (rest[0] === 'off') {
@@ -564,7 +597,7 @@ try {
       try { await hookStart() } catch {}
       break
     default:
-      say('команды: setup | status | start | stop | restart | logs [n] | close N|all | max [N] | idle [2h|off] | autostart on|off | commands [--force] | patch | unpatch | guide [ru|en]')
+      say('команды: setup | status | start | stop | restart | logs [n] | close N|all | max [N] | idle [2h|off] | send <тема> <текст> | autostart on|off | commands [--force] | patch | unpatch | guide [ru|en]')
       code = 1
   }
 } catch (err) {
