@@ -40,6 +40,8 @@ export type Config = {
   wtWindow: string
   command: string[]
   maxSessions: number
+  /** Close a topic session after this many minutes without messages or work (like /stop); 0 = never. */
+  idleCloseMin: number
   spawnTimeoutSec: number
   queueTtlSec: number
   announceSpawn: boolean
@@ -73,6 +75,7 @@ export function defaultConfig(): Config {
     wtWindow: 'tg-sessions',
     command: [],
     maxSessions: 8,
+    idleCloseMin: 0,
     spawnTimeoutSec: 180,
     queueTtlSec: 900,
     announceSpawn: true,

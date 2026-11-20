@@ -1,7 +1,7 @@
 ---
 name: router
 description: Control the tg-topics Telegram router — status, start, stop, restart, logs, close a topic session, change the parallel session limit, autostart on/off, re-sync the bot's command menu, apply/remove the overlay on the official telegram plugin. Use when the user asks about Telegram topic sessions, the router, why the bot doesn't answer, or to restart the Telegram router.
-argument-hint: "status | start | stop | restart | logs [n] | close N|all | max [N] | autostart on|off | commands [--force] | patch | unpatch"
+argument-hint: "status | start | stop | restart | logs [n] | close N|all | max [N] | idle [2h|off] | autostart on|off | commands [--force] | patch | unpatch"
 user-invocable: true
 allowed-tools:
   - Bash(bun *)
@@ -31,6 +31,10 @@ What the subcommands do:
   closes; the topic's memory stays and its next message starts it again.
 - `max [N]` — show or set the parallel session limit (1–50, saved in
   config.json, applied by the running router at once).
+- `idle [2h|30m|1d|off]` — show or set auto-close of idle topic sessions: a
+  topic session with no messages and no work (busy mark, background jobs) for
+  that long is closed like `close`; `off` turns it off (the default). The
+  main DM session is never closed. Same as the bot's `/idle`.
 - `autostart on|off` — start the router at Windows sign-in.
 - `commands [--force]` — write the bot's command menu now (normally automatic
   on first connect and when the token switches to another bot).

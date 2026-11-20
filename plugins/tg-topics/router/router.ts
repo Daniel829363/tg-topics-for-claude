@@ -33,7 +33,7 @@ import { randomBytes } from 'crypto'
 import { spawn } from 'child_process'
 import type { ServerWebSocket } from 'bun'
 import { loadConfig, applyOverlay, readToken, secretFile, updateConfigFile, routeFile, PLUGIN_VERSION, STATE, LOG_FILE, CONFIG_FILE } from '../lib/common.ts'
-import { parseCommand, handleCommand, ensureBotCommands, MAX_SESSIONS_CAP, type AccessLike, type SessionItem, type RouterControl } from '../overlay/bot-ui.ts'
+import { parseCommand, handleCommand, ensureBotCommands, MAX_SESSIONS_CAP, IDLE_MIN, IDLE_MAX, fmtIdle, type AccessLike, type SessionItem, type RouterControl } from '../overlay/bot-ui.ts'
 
 const TEMPLATES = join(import.meta.dir, 'templates')
 const cfg = loadConfig()
@@ -251,7 +251,48 @@ function send(route: string, payload: string): boolean {
   const c = clients.get(route)
   if (!c) return false
   c.ws.send(payload)
+  lastActive.set(route, Date.now())
   return true
+}
+
+// ---- Auto-close of idle sessions (/idle) ------------------------------------
+// A topic session is idle when it got no message and showed no work (busy mark: a turn running,
+// or background shells/agents) for cfg.idleCloseMin minutes. It is then closed like /stop; the
+// next message in the topic starts it again. The main DM session is never closed.
+const lastActive = new Map<string, number>()
+const MINUTE_MS = Number(process.env.TG_TEST_MINUTE_MS) || 60_000
+
+async function closeIdleSessions(): Promise<void> {
+  if (!cfg.idleCloseMin) return
+  const now = Date.now()
+  const idle: string[] = []
+  for (const route of clients.keys()) {
+    if (isBusy(route)) { lastActive.set(route, now); continue }
+    if (!lastActive.has(route)) lastActive.set(route, now)
+    if (route !== 'dm' && now - lastActive.get(route)! >= cfg.idleCloseMin * MINUTE_MS) idle.push(route)
+  }
+  if (!idle.length) return
+  const closed = await stopSessions(idle)
+  for (const route of closed) {
+    lastActive.delete(route)
+    log(`closed idle session ${route} (no messages or work for ${cfg.idleCloseMin} min)`)
+    const { chat_id, thread } = parseRoute(route)
+    if (chat_id) void tg('sendMessage', {
+      chat_id, disable_notification: true, ...(thread != null ? { message_thread_id: thread } : {}),
+      text: `💤 Сессия закрыта: ${fmtIdle(cfg.idleCloseMin, 'ru')} без сообщений и работы. Следующее сообщение в теме запустит её снова.`,
+    }).catch(err => log('notify failed:', String(err)))
+  }
+}
+setInterval(() => { void closeIdleSessions().catch(err => log('idle check failed:', String(err))) }, Math.min(60_000, MINUTE_MS)).unref?.()
+
+function setIdleClose(min: number): void {
+  const old = cfg.idleCloseMin
+  cfg.idleCloseMin = min
+  updateConfigFile({ idleCloseMin: min })
+  // Count from now: sessions that sat unused before the change get the full time.
+  const now = Date.now()
+  for (const route of clients.keys()) lastActive.set(route, Math.max(lastActive.get(route) ?? 0, now))
+  log(`idle auto-close ${old || 'off'} → ${min || 'off'} min`)
 }
 
 function broadcast(payload: string): void {
@@ -284,6 +325,8 @@ function sessionList(): SessionItem[] {
 
 const control: RouterControl = {
   get maxSessions() { return cfg.maxSessions },
+  get idleCloseMin() { return cfg.idleCloseMin },
+  setIdleClose,
   stop: routes => stopSessions(routes),
   setMaxSessions,
 }
@@ -834,8 +877,15 @@ const server = (() => {
         if (url.pathname === '/control' && req.method === 'POST') {
           if (req.headers.get('x-tg-router-secret') !== SECRET) return new Response('forbidden', { status: 403 })
           return (async () => {
-            const body = (await req.json().catch(() => ({}))) as { stop?: string[]; maxSessions?: number }
+            const body = (await req.json().catch(() => ({}))) as { stop?: string[]; maxSessions?: number; idleCloseMin?: number }
             if (Array.isArray(body.stop)) return Response.json({ closed: await stopSessions(body.stop.map(String)) })
+            if (body.idleCloseMin !== undefined) {
+              const v = body.idleCloseMin
+              if (!Number.isInteger(v) || (v !== 0 && (v < IDLE_MIN || v > IDLE_MAX))) return Response.json({ error: `idleCloseMin: 0 or ${IDLE_MIN}..${IDLE_MAX}` }, { status: 400 })
+              const old = cfg.idleCloseMin
+              setIdleClose(v)
+              return Response.json({ idleCloseMin: v, old })
+            }
             const n = body.maxSessions
             if (typeof n === 'number' && Number.isInteger(n) && n >= 1 && n <= MAX_SESSIONS_CAP) {
               const old = cfg.maxSessions
@@ -850,6 +900,7 @@ const server = (() => {
             version: PLUGIN_VERSION,
             bot: botUsername,
             maxSessions: cfg.maxSessions,
+            idleCloseMin: cfg.idleCloseMin,
             sessions: [...clients.values()].map(c => ({ route: c.route, ...infoFor(c.route), dir: c.dir, pid: c.pid, since: new Date(c.since).toISOString() })),
             starting: [...pending.keys()],
             live: Object.keys(live),
@@ -879,6 +930,7 @@ const server = (() => {
           }
           ws.data.route = route
           clients.set(route, { ws, route, pid: m.pid, dir: m.dir, since: Date.now() })
+          lastActive.set(route, Date.now())
           if (pending.delete(route)) saveQueue()
           ws.send(JSON.stringify({ t: 'welcome', route, info: infoFor(route) }))
           log(`session connected: ${route}${old ? ' (replaced previous)' : ''} pid=${m.pid} dir=${m.dir}`)

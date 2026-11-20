@@ -8,6 +8,7 @@
  *   bun tgt.ts logs [lines]                                   tail the router log
  *   bun tgt.ts close N | all | <route>                        close a Claude session (N from status)
  *   bun tgt.ts max [N]                                        show / set the parallel session limit
+ *   bun tgt.ts idle [2h|30m|1d|off]                           show / set auto-close of idle topic sessions
  *   bun tgt.ts autostart on|off                               start the router at Windows sign-in
  *   bun tgt.ts commands [--force]                             sync the bot's command menu now
  *   bun tgt.ts patch | unpatch                                apply / remove the overlay on the official plugin
@@ -23,7 +24,7 @@ import {
   PLUGIN_ROOT, PLUGIN_VERSION, HOME, CONFIG_FILE, LOG_FILE, CLAUDE_DIR, SESSION_SETTINGS, INSTALLED_PLUGINS, OFFICIAL_KEY,
   type Config,
 } from '../lib/common.ts'
-import { ensureBotCommands, apiCaller, setupGuide, langOf, COMMANDS_MARKER, MAX_SESSIONS_CAP, type AccessLike } from '../overlay/bot-ui.ts'
+import { ensureBotCommands, apiCaller, setupGuide, langOf, COMMANDS_MARKER, MAX_SESSIONS_CAP, IDLE_MIN, IDLE_MAX, parseIdle, fmtIdle, type AccessLike } from '../overlay/bot-ui.ts'
 
 const IS_WIN = process.platform === 'win32'
 const API_ROOT = (process.env.TELEGRAM_API_ROOT ?? 'https://api.telegram.org').replace(/\/+$/, '')
@@ -246,6 +247,34 @@ async function maxSessions(arg: string | undefined): Promise<number> {
   return 0
 }
 
+async function idleClose(arg: string | undefined): Promise<number> {
+  const show = (m: number) => (m ? fmtIdle(m, 'ru') : 'выкл')
+  if (!arg) {
+    const st = await routerStatus()
+    say(`автозакрытие сессий тем без сообщений и работы: ${show(st?.idleCloseMin ?? cfg.idleCloseMin)}`)
+    return 0
+  }
+  const min = parseIdle(arg)
+  if (min === undefined || (min !== 0 && (min < IDLE_MIN || min > IDLE_MAX))) { say(`примеры: idle 30m | idle 2h | idle 1d | idle off (от ${IDLE_MIN} мин до 30 дней)`); return 1 }
+  if (await health()) {
+    const res = await fetch(`${routerHttp(cfg)}/control`, {
+      method: 'POST',
+      headers: { 'x-tg-router-secret': routerSecret(), 'content-type': 'application/json' },
+      body: JSON.stringify({ idleCloseMin: min }),
+      signal: AbortSignal.timeout(5000),
+    }).catch(() => null)
+    if (res?.ok) {
+      const r = (await res.json()) as { old: number }
+      say(`✅ автозакрытие: ${show(r.old)} → ${show(min)} (роутер применил сразу)`)
+      return 0
+    }
+  }
+  const old = cfg.idleCloseMin
+  updateConfigFile({ idleCloseMin: min })
+  say(`✅ автозакрытие: ${show(old)} → ${show(min)} (записано в ${CONFIG_FILE}; запущенный роутер старой версии подхватит после /tg-topics:router restart)`)
+  return 0
+}
+
 // ---- Settings -------------------------------------------------------------------
 
 function readJson(file: string): any {
@@ -429,7 +458,7 @@ async function status(): Promise<void> {
     try {
       const st = (await (await fetch(`${routerHttp(cfg)}/status`)).json()) as any
       const list = sessionRoutes(st)
-      say(`Сессии:       ${list.length} из ${st.maxSessions ?? cfg.maxSessions} (закрыть: close N, лимит: max N)`)
+      say(`Сессии:       ${list.length} из ${st.maxSessions ?? cfg.maxSessions} (закрыть: close N, лимит: max N)${(st.idleCloseMin ?? cfg.idleCloseMin) ? `, автозакрытие: ${fmtIdle(st.idleCloseMin ?? cfg.idleCloseMin, "ru")}` : ""}`)
       list.forEach((s, i) => say(`  ${i + 1}. ${s.starting ? '⏳' : '🟢'} ${s.label}${s.starting ? ' — запускается' : ` — ${st.sessions.find((c: any) => c.route === s.route)?.dir ?? ''}`}`))
       if (!list.length) say('  сессий нет — запустятся на первое сообщение')
     } catch {}
@@ -501,6 +530,9 @@ try {
     case 'max':
       code = await maxSessions(rest[0])
       break
+    case 'idle':
+      code = await idleClose(rest[0])
+      break
     case 'autostart':
       if (!IS_WIN) { say('автозапуск настраивается только на Windows; на macOS/Linux добавь `bun ' + LAUNCH_TS + '` в автозагрузку сам'); break }
       if (rest[0] === 'off') {
@@ -532,7 +564,7 @@ try {
       try { await hookStart() } catch {}
       break
     default:
-      say('команды: setup | status | start | stop | restart | logs [n] | close N|all | max [N] | autostart on|off | commands [--force] | patch | unpatch | guide [ru|en]')
+      say('команды: setup | status | start | stop | restart | logs [n] | close N|all | max [N] | idle [2h|off] | autostart on|off | commands [--force] | patch | unpatch | guide [ru|en]')
       code = 1
   }
 } catch (err) {

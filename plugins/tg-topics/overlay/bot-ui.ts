@@ -36,6 +36,7 @@ const PRIVATE_MENU: MenuItem[] = [
   { command: 'sessions', ru: 'Запущенные сессии Claude', en: 'Running Claude sessions' },
   { command: 'stop', ru: 'Закрыть сессию: /stop N или /stop all', en: 'Close a session: /stop N or /stop all' },
   { command: 'maxsessions', ru: 'Лимит сессий: /maxsessions 12', en: 'Session limit: /maxsessions 12' },
+  { command: 'idle', ru: 'Автозакрытие простоя: /idle 2h, /idle off', en: 'Auto-close idle sessions: /idle 2h, /idle off' },
   { command: 'limits', ru: 'Лимиты Claude: сессия и неделя', en: 'Claude usage limits: session and week' },
 ]
 
@@ -46,13 +47,38 @@ const GROUP_MENU: MenuItem[] = [
   { command: 'sessions', ru: 'Запущенные сессии Claude', en: 'Running Claude sessions' },
   { command: 'stop', ru: 'Закрыть сессию этой темы', en: "Close this topic's session" },
   { command: 'maxsessions', ru: 'Лимит параллельных сессий', en: 'Parallel session limit' },
+  { command: 'idle', ru: 'Автозакрытие сессий без дела', en: 'Auto-close idle sessions' },
   { command: 'limits', ru: 'Лимиты Claude', en: 'Claude usage limits' },
 ]
 
-export const KNOWN_COMMANDS = new Set(['start', 'help', 'setup', 'id', 'status', 'sessions', 'stop', 'maxsessions', 'limits'])
+export const KNOWN_COMMANDS = new Set(['start', 'help', 'setup', 'id', 'status', 'sessions', 'stop', 'maxsessions', 'idle', 'limits'])
 
 /** Upper bound for /maxsessions — every session is a full Claude Code process. */
 export const MAX_SESSIONS_CAP = 50
+
+/** /idle bounds, minutes: 5 min … 30 days. */
+export const IDLE_MIN = 5
+export const IDLE_MAX = 30 * 24 * 60
+
+/** "90", "90m", "2h", "1.5h", "1d", "1h30m", "off"/"0" → minutes (0 = off); undefined if unparseable. */
+export function parseIdle(arg: string): number | undefined {
+  const a = arg.trim().toLowerCase().replace(',', '.').replace(/\s+/g, '')
+  if (!a) return undefined
+  if (/^(off|no|нет|выкл|0)$/.test(a)) return 0
+  if (/^\d+(\.\d+)?$/.test(a)) return Math.round(Number(a))
+  const units: Record<string, number> = { m: 1, min: 1, 'м': 1, 'мин': 1, h: 60, 'ч': 60, d: 1440, 'д': 1440 }
+  const re = /(\d+(?:\.\d+)?)(min|мин|m|м|h|ч|d|д)/g
+  let total = 0, eaten = 0, m: RegExpExecArray | null
+  while ((m = re.exec(a))) { total += Number(m[1]) * units[m[2]!]!; eaten += m[0].length }
+  return eaten === a.length && total > 0 ? Math.round(total) : undefined
+}
+
+/** 150 → "2 ч 30 мин" / "2 h 30 min". */
+export function fmtIdle(min: number, lang: Lang): string {
+  const d = Math.floor(min / 1440), h = Math.floor((min % 1440) / 60), m = min % 60
+  const [dd, hh, mm] = lang === 'ru' ? ['д', 'ч', 'мин'] : ['d', 'h', 'min']
+  return [d && `${d} ${dd}`, h && `${h} ${hh}`, m && `${m} ${mm}`].filter(Boolean).join(' ') || `0 ${mm}`
+}
 
 function menu(items: MenuItem[], lang: Lang): { command: string; description: string }[] {
   return items.map(i => ({ command: i.command, description: i[lang] }))
@@ -152,6 +178,9 @@ export type RouterControl = {
   /** Closes the sessions of these routes; resolves to the routes actually closed. */
   stop(routes: string[]): Promise<string[]>
   setMaxSessions(n: number): void
+  /** Minutes without messages or work after which a topic session is closed; 0 = never. */
+  idleCloseMin: number
+  setIdleClose(min: number): void
 }
 
 export type CommandEnv = {
@@ -219,6 +248,18 @@ function maxSessionsCommand(msg: any, env: CommandEnv, t: Texts): string {
   return t.maxSet(n, old, used)
 }
 
+/** /idle — show the auto-close setting, or "/idle 2h" / "/idle off" to change it. */
+function idleCommand(msg: any, env: CommandEnv, t: Texts): string {
+  if (!env.sessions || !env.control) return t.sessions(undefined)
+  const arg = argOf(msg)
+  const cur = env.control.idleCloseMin
+  if (!arg) return t.idleShow(cur)
+  const min = parseIdle(arg)
+  if (min === undefined || (min !== 0 && (min < IDLE_MIN || min > IDLE_MAX))) return t.idleBad(cur)
+  env.control.setIdleClose(min)
+  return t.idleSet(min, cur)
+}
+
 /**
  * HTML reply for a known command, or null to stay silent. Same rules as the
  * channel's gate: strangers get nothing in allowlist mode and in groups that
@@ -248,6 +289,7 @@ export async function handleCommand(cmd: string, msg: any, env: CommandEnv): Pro
       case 'sessions': return owner ? t.sessions(env.sessions, env.control?.maxSessions) : null
       case 'stop': return owner ? stopCommand(msg, env, t) : null
       case 'maxsessions': return owner ? maxSessionsCommand(msg, env, t) : null
+      case 'idle': return owner ? idleCommand(msg, env, t) : null
       case 'limits': return owner ? limitsText(lang) : null
     }
     return null
@@ -283,6 +325,8 @@ export async function handleCommand(cmd: string, msg: any, env: CommandEnv): Pro
         return owner ? stopCommand(msg, env, t) : null
       case 'maxsessions':
         return owner ? maxSessionsCommand(msg, env, t) : null
+      case 'idle':
+        return owner ? idleCommand(msg, env, t) : null
       case 'limits':
         return owner ? limitsText(lang) : null
     }
@@ -402,6 +446,9 @@ type Texts = {
   maxShow(max: number, used: number): string
   maxSet(max: number, old: number, used: number): string
   maxBad(max: number): string
+  idleShow(min: number): string
+  idleSet(min: number, old: number): string
+  idleBad(min: number): string
   limits(plan: string, rows: LimitRow[]): string
   limitsError(kind: 'login' | 'expired' | 'failed', detail?: string): string
 }
@@ -458,6 +505,7 @@ const RU: Texts = {
     '/sessions — запущенные сессии',
     '/stop — закрыть сессию',
     '/maxsessions — лимит сессий',
+    '/idle — автозакрытие сессий без дела',
     '/limits — лимиты Claude',
   ].join('\n'),
 
@@ -495,6 +543,7 @@ const RU: Texts = {
     '/sessions — запущенные сессии Claude (с номерами)',
     '/stop N — закрыть сессию N из /sessions; /stop all — все темы; /stop в теме — её сессию',
     '/maxsessions — лимит параллельных сессий; /maxsessions 12 — поменять',
+    '/idle 2h — закрывать сессию темы после 2 ч без сообщений и работы; /idle off — выключить',
     '/limits — сколько лимита Claude израсходовано и когда сброс',
     '',
     'Текст в рамке копируется нажатием.',
@@ -605,6 +654,17 @@ const RU: Texts = {
 
   maxBad: max => `Нужно число от 1 до ${MAX_SESSIONS_CAP}, например ${code('/maxsessions 12')}. Сейчас лимит: ${max}.`,
 
+  idleShow: min => [
+    min ? `💤 Автозакрытие: сессия темы закрывается, если в ней <b>${fmtIdle(min, 'ru')}</b> не было сообщений и работы.` : '💤 Автозакрытие выключено: сессии тем работают, пока их не закроешь через /stop.',
+    `Поменять: ${code('/idle 2h')}, ${code('/idle 30m')}, ${code('/idle 1d')}; выключить: ${code('/idle off')}. Сессия, которая работает (в том числе в фоне), не закрывается; основная сессия в личке тоже.`,
+  ].join('\n'),
+
+  idleSet: (min, old) => min
+    ? `✅ Автозакрытие: ${old ? fmtIdle(old, 'ru') : 'выкл'} → <b>${fmtIdle(min, 'ru')}</b> без сообщений и работы. Закрывается как через /stop: новое сообщение в теме снова запустит сессию, память и инструкции сохранены.`
+    : `✅ Автозакрытие выключено${old ? ` (было ${fmtIdle(old, 'ru')})` : ''}.`,
+
+  idleBad: min => `Не понял время. Примеры: ${code('/idle 30m')}, ${code('/idle 2h')}, ${code('/idle 1d')}, ${code('/idle off')} (от ${IDLE_MIN} мин до 30 дней). Сейчас: ${min ? fmtIdle(min, 'ru') : 'выкл'}.`,
+
   limits: (plan, rows) => [
     `📊 <b>Лимиты Claude</b>${plan ? ` · ${esc(plan)}` : ''}`,
     ...limitLines(rows, 'ru', r =>
@@ -638,6 +698,7 @@ const EN: Texts = {
     '/sessions — running sessions',
     '/stop — close a session',
     '/maxsessions — session limit',
+    '/idle — auto-close idle sessions',
     '/limits — Claude usage limits',
   ].join('\n'),
 
@@ -675,6 +736,7 @@ const EN: Texts = {
     '/sessions — running Claude sessions (numbered)',
     '/stop N — close session N from /sessions; /stop all — every topic; /stop in a topic — its session',
     '/maxsessions — parallel session limit; /maxsessions 12 — change it',
+    '/idle 2h — close a topic session after 2 h without messages or work; /idle off — turn off',
     '/limits — how much of the Claude usage limits is used and when they reset',
     '',
     'Tap any boxed text to copy it.',
@@ -784,6 +846,17 @@ const EN: Texts = {
   ].join('\n'),
 
   maxBad: max => `Send a number from 1 to ${MAX_SESSIONS_CAP}, e.g. ${code('/maxsessions 12')}. The limit now: ${max}.`,
+
+  idleShow: min => [
+    min ? `💤 Auto-close: a topic session is closed after <b>${fmtIdle(min, 'en')}</b> without messages or work.` : '💤 Auto-close is off: topic sessions run until you close them with /stop.',
+    `Change it: ${code('/idle 2h')}, ${code('/idle 30m')}, ${code('/idle 1d')}; turn off: ${code('/idle off')}. A session that is working (in the background too) is never closed, nor is the main DM session.`,
+  ].join('\n'),
+
+  idleSet: (min, old) => min
+    ? `✅ Auto-close: ${old ? fmtIdle(old, 'en') : 'off'} → <b>${fmtIdle(min, 'en')}</b> without messages or work. It closes like /stop: the next message in the topic starts the session again, memory and instructions are kept.`
+    : `✅ Auto-close is off${old ? ` (was ${fmtIdle(old, 'en')})` : ''}.`,
+
+  idleBad: min => `Couldn't read the time. Examples: ${code('/idle 30m')}, ${code('/idle 2h')}, ${code('/idle 1d')}, ${code('/idle off')} (${IDLE_MIN} min to 30 days). Now: ${min ? fmtIdle(min, 'en') : 'off'}.`,
 
   limits: (plan, rows) => [
     `📊 <b>Claude usage limits</b>${plan ? ` · ${esc(plan)}` : ''}`,

@@ -66,7 +66,8 @@ const env = {
   TG_TEST_OUT: TMP,
   TG_TEST_TOPICS: PLUGIN,
   TELEGRAM_PROGRESS_TICK_MS: '300',
-  TG_TEST_SLOW_ROUTE: '-1001:30',
+  TG_TEST_SLOW_ROUTE: '-1001:40',
+  TG_TEST_MINUTE_MS: '1000',
 }
 delete (env as any).TELEGRAM_ROUTE
 delete (env as any).TELEGRAM_TOPIC_DIR
@@ -365,22 +366,42 @@ try {
   check(await replyTo(111, /♻️.*восстанавливаю сессии \(3\).*Продолжат прерванную работу: Тест группа \/ Сценарии/s), 'the owner gets one DM listing the restored sessions')
 
   // ---- Q: messages sent while a session is still starting survive a router restart — all of them, in order
-  await push(groupMsg(-1001, 30, 'очередь 1', { reply_to_message: topicRoot(30, 'Очередь') }))
-  await waitFor(async () => ((await status())?.starting ?? []).includes('-1001:30') || undefined, 10_000, 'topic 30 starting')
-  await push(groupMsg(-1001, 30, 'очередь 2'))
-  await push(groupMsg(-1001, 30, 'очередь 3'))
-  await waitFor(async () => (((await status())?.queued ?? {})['-1001:30'] >= 3) || undefined, 5000, '3 queued')
+  await push(groupMsg(-1001, 40, 'очередь 1', { reply_to_message: topicRoot(40, 'Очередь') }))
+  await waitFor(async () => ((await status())?.starting ?? []).includes('-1001:40') || undefined, 10_000, 'topic 40 starting')
+  await push(groupMsg(-1001, 40, 'очередь 2'))
+  await push(groupMsg(-1001, 40, 'очередь 3'))
+  await waitFor(async () => (((await status())?.queued ?? {})['-1001:40'] >= 3) || undefined, 5000, '3 queued')
   router.kill()
   await router.exited
   router = startRouter()
   await waitFor(status, 5000, 'router up again')
-  await push(groupMsg(-1001, 30, 'очередь 4'))
+  await push(groupMsg(-1001, 40, 'очередь 4'))
   const got = await waitFor(async () => {
-    const s = sessions().filter(s => s.kind === 'inbound' && s.route === '-1001:30').map(s => String(s.data.content))
+    const s = sessions().filter(s => s.kind === 'inbound' && s.route === '-1001:40').map(s => String(s.data.content))
     return s.length >= 4 ? s : undefined
   }, 30_000, '4 queued messages delivered')
   check(got?.join('|') === 'очередь 1|очередь 2|очередь 3|очередь 4', `all messages sent before the session connected arrive, in order, across a router restart (${got?.join('|')})`)
-  check(sessions().filter(s => s.kind === 'spawned' && s.route === '-1001:30').length === 1, 'the restart did not open a second session for the starting topic')
+  check(sessions().filter(s => s.kind === 'spawned' && s.route === '-1001:40').length === 1, 'the restart did not open a second session for the starting topic')
+
+  // ---- I: /idle closes topic sessions without messages or work (TG_TEST_MINUTE_MS: 1 "minute" = 1 s)
+  await push(cmd(dm(111, '/idle')))
+  check(await replyTo(111, /Автозакрытие выключено/), '/idle shows that auto-close is off by default')
+  await push(cmd(dm(111, '/idle 2x')))
+  check(await replyTo(111, /Не понял время/), '/idle rejects a time it cannot read')
+  await push(groupMsg(-1001, 20, 'долгая задача'))
+  await waitFor(async () => (await sent()).filter(m => String(m.text).endsWith('долгая задача')).length >= 2 || undefined, 15_000, 'second long task delivered')
+  const liveIdle = ((await status())?.sessions ?? []).map((s: any) => s.route).sort()
+  await push(cmd(dm(111, '/idle 5m')))
+  check(await replyTo(111, /Автозакрытие: выкл → <b>5 мин<\/b>/), '/idle 5m turns auto-close on')
+  check(JSON.parse(readFileSync(join(TMP, 'config.json'), 'utf8')).idleCloseMin === 5, 'idleCloseMin saved to config.json')
+  const afterIdle = await waitFor(async () => {
+    const r = ((await status())?.sessions ?? []).map((s: any) => s.route).sort()
+    return r.length < liveIdle.length && !r.includes('-1001:40') && !r.includes('-1002:5') ? r : undefined
+  }, 20_000, 'idle sessions closed')
+  check(afterIdle?.join() === ['-1001:20', 'dm'].join(), `idle topic sessions closed; the busy one and the DM session stay (${liveIdle.join(', ')} → ${afterIdle?.join(', ')})`)
+  check(await replyTo(-1001, /💤 Сессия закрыта: 5 мин без сообщений/), 'the closed topic gets a quiet 💤 notice')
+  const tidle = tgt('idle', 'off')
+  check(tidle.code === 0 && (await status())?.idleCloseMin === 0, `terminal: tgt idle off (${tidle.out.trim()})`)
 } finally {
   router.kill()
   for (const s of sessions().filter(s => s.kind === 'spawned')) { try { process.kill(s.pid) } catch {} }
